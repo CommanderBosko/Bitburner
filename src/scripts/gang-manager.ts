@@ -1,5 +1,5 @@
 import type { NS } from "../NetscriptDefinitions";
-import type { GangMemberSnapshot, GangTaskSnapshot, GangStateReport } from "../lib/types";
+import type { GangMemberSnapshot, GangTaskSnapshot, GangEquipmentSnapshot, GangStateReport } from "../lib/types";
 
 // Split into a cheap orchestrator + transient gang-agent-*.ts workers (2026-08-10, user-directed
 // RAM fix - see [[bitburner_bn4_singularity]]): the previous single-file gang-manager.ts
@@ -151,15 +151,26 @@ interface TaskAssignment {
 function computeTaskAssignments(report: GangStateReport): TaskAssignment[] {
 	const wantRespect = report.respect < EARN_MONEY_RESPECT_THRESHOLD && report.respect < report.respectForNextRecruitThreshold;
 
-	// Once respect is no longer the priority, dedicate trained members to growing gang power
-	// instead of jumping straight to earning money. Researched (game source + community): only
-	// members actually assigned to the "Territory Warfare" task contribute to the gang's
-	// aggregate power (it earns $0/0 respect - see tasks.ts - its sole purpose is the power
-	// contribution described in its own in-game tooltip), and this is risk-free as long as
-	// ns.gang.setTerritoryWarfare() engagement stays off - member death only happens during an
-	// actual clash, gated separately by computeWarfareDecision/gang-agent-warfare.ts below. Stops
-	// once there's no territory left worth fighting for.
-	const wantPowerGrowth = !wantRespect && report.rivals.length > 0 && report.territory < TERRITORY_FULL_FRACTION;
+	// Once respect is no longer the priority, earn money (to keep funding computeEquipmentPurchases
+	// below) rather than jumping straight to territory warfare - user-directed 2026-08-24: money is
+	// the priority right up until every current member is fully equipped, only then does the gang
+	// commit to territory. hasUnownedEquipment ignores affordability (unlike
+	// computeEquipmentPurchases's RESERVE_FRACTION-gated budget check) because Territory Warfare
+	// earns $0/0 - see below - so money stops growing the moment the switch happens; gating on
+	// "currently affordable" instead could permanently strand an expensive unbought item. This also
+	// self-corrects for new recruits: a freshly recruited member starts with empty
+	// upgrades/augmentations, so hasUnownedEquipment flips true again on the next report and the
+	// gang drops back to earning money to gear them up before resuming territory.
+	//
+	// Once fully equipped, dedicate trained members to growing gang power instead of continuing to
+	// earn money. Researched (game source + community): only members actually assigned to the
+	// "Territory Warfare" task contribute to the gang's aggregate power (it earns $0/0 respect - see
+	// tasks.ts - its sole purpose is the power contribution described in its own in-game tooltip),
+	// and this is risk-free as long as ns.gang.setTerritoryWarfare() engagement stays off - member
+	// death only happens during an actual clash, gated separately by
+	// computeWarfareDecision/gang-agent-warfare.ts below. Stops once there's no territory left worth
+	// fighting for.
+	const wantPowerGrowth = !wantRespect && !hasUnownedEquipment(report) && report.rivals.length > 0 && report.territory < TERRITORY_FULL_FRACTION;
 	const territoryWarfareTaskName = wantPowerGrowth
 		? report.tasks.find((t) => t.name === TERRITORY_WARFARE_TASK_NAME)?.name
 		: undefined;
@@ -178,14 +189,31 @@ function computeTaskAssignments(report: GangStateReport): TaskAssignment[] {
 	return assignments;
 }
 
+// Shared by hasUnownedEquipment (right below) and computeEquipmentPurchases (further below) -
+// equipment/augmentation items matching the gang's own type, the same set either function needs
+// to reason about ownership of.
+function relevantEquipment(report: GangStateReport): GangEquipmentSnapshot[] {
+	return report.equipment.filter((item) => (report.isHacking ? item.isHacking : item.isCombat));
+}
+
+// Ignores cost entirely (unlike computeEquipmentPurchases's budget-gated purchase list) - used to
+// decide whether the gang is *done* buying, not what it can afford to buy right now. See
+// wantPowerGrowth's comment above for why that distinction matters.
+function hasUnownedEquipment(report: GangStateReport): boolean {
+	const relevant = relevantEquipment(report);
+	return report.members.some((member) => {
+		const owned = new Set([...member.upgrades, ...member.augmentations]);
+		return relevant.some((item) => !owned.has(item.name));
+	});
+}
+
 interface EquipmentPurchase {
 	memberName: string;
 	equipmentName: string;
 }
 
 function computeEquipmentPurchases(report: GangStateReport): EquipmentPurchase[] {
-	const relevant = report.equipment.filter((item) => (report.isHacking ? item.isHacking : item.isCombat));
-	const sorted = [...relevant].sort((a, b) => a.cost - b.cost);
+	const sorted = [...relevantEquipment(report)].sort((a, b) => a.cost - b.cost);
 
 	const purchases: EquipmentPurchase[] = [];
 	let remaining = report.playerMoney * (1 - RESERVE_FRACTION);
