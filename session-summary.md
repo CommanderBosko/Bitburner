@@ -1,3 +1,26 @@
+## Session: 2026-08-24 — gang-manager earns money for equipment before committing to Territory Warfare
+
+**Focus**: User-directed fix — the gang should keep working money-earning tasks until every current member is fully equipped, only then switch to Territory Warfare, instead of jumping to territory the moment respect is capped.
+
+### What changed (and why)
+- **`c8fc5ab`** — `gang-manager.ts`: added a new "earn money" phase to `computeTaskAssignments`'s per-member priority chain, between respect-grinding and Territory Warfare. Previously, hitting the respect target sent members straight to Territory Warfare because rivals are almost always present — the existing "earn money" fallback branch was effectively dead code, so equipment/augmentations rarely got bought before territory play began (which pays $0/$0, so money growth stops right after the switch). Added `hasUnownedEquipment()`, gating the new phase (and `wantPowerGrowth`) on ownership rather than affordability, so an expensive item can't strand the gang mid-switch. Factored out `relevantEquipment()` so the gate shares its filter with the existing (unconditional, every-tick) `computeEquipmentPurchases()`.
+- Also explained the gang-manager's full operation order to the user this session (per-tick dispatch order vs. per-member task-priority order) — informational only, no code change.
+
+### Decisions
+- Gate the new phase on equipment *ownership*, not current affordability — affordability-gating could permanently strand a pricier item the gang would never out-earn once territory's $0/$0 tasks take over.
+- Self-correcting by design: a freshly recruited (unequipped) member flips `hasUnownedEquipment` true again, dropping the whole gang back to earning until they're geared up too — no special-casing needed for new recruits.
+
+### Issues / surprises
+- None — build-checked clean (`npm run build` exit 0), confirmed the compiled `dist/scripts/gang-manager.js` carries the new logic, `dev-watch` synced it in live.
+
+### Next session
+- Confirm the new phase actually holds in-game — watch a gang cycle with real unowned equipment to see it stay on earning tasks (not jump straight to territory), and confirm a new recruit re-triggers it.
+- BN4.3 items carried forward unchanged (karma HUD window position, backdoor-loop `w0r1d_d43m0n` trigger, territory-warfare threshold, NFG-donation branch — all still unconfirmed live).
+
+**Commits**: `0bcabd8..c8fc5ab` (1 commit this session: `c8fc5ab`)
+
+---
+
 ## Session: 2026-08-20 — karma.ts gets a live HUD tail window; redundant tprint prefix dropped
 
 **Focus**: Two small polish fixes, no BitNode progress — replace `karma.ts`'s one-shot karma print with a live HUD (karma + karma/minute), and drop a doubled-up `tprint` prefix in `gang-agent-found.ts`.
@@ -101,25 +124,3 @@ _Older entries are in [session-summary-archive.md](session-summary-archive.md)._
 
 ---
 
-## Session: 2026-08-16 — BN4 cleared for real (SF4.1), replay started (BN4.2), crime-loop's fresh-BitNode-entry RAM race confirmed
-
-**Focus**: No code changes — a play/BitNode-transition session. Confirm BN4's real clear, decide the next move, and re-verify the post-restart crime fallback against a genuine fresh BitNode entry rather than just an augment-install reset.
-
-### What changed (and why)
-- No game-code changes this session (`git status` clean throughout, nothing to commit or push). All updates were to memory/docs plus routine `dev-watch` housekeeping.
-- **BN4 destroyed for real (not flumed) — SF4.1 obtained.** The automation confirmed live through 2026-08-15 (gang founding, territory warfare, NFG-gate hand-off, post-restart crime) carried the character to a genuine clear.
-- **`crime-loop.ts`'s post-restart RAM-race fallback (`a7bc3e4`, fixed 2026-08-15) re-verified against a true fresh BitNode entry** — untested before, since a BitNode entry resets home RAM to 32GB while an augment install leaves RAM/cores intact. Two `ps` snapshots (immediately after restart, then after `home-ram-loop.js`'s first 32GB→64GB purchase) confirmed the delay was a real but self-resolving RAM race, not a bug — `crime-loop.js` and 3 other `[gated ≥ 64GB]` scripts all joined the instant the threshold cleared.
-
-### Decisions
-- **Replay BN4 two more times (now in BN4.2) before moving to BN6/BN7**, per `[[bitburner_bitnode_route]]`'s researched order — staying at SF4.1 means every future BitNode pays a 16x RAM tax on this repo's entirely `ns.singularity.*`/`ns.gang.*`-based automation stack. Since the automation is already proven end-to-end, each replay should be mostly hands-off.
-
-### Issues / surprises
-- A fresh BitNode entry resets all in-playthrough state (karma, gang, augmentations) even though Source-Files persist — so the 2026-08-15 live confirmations (Territory Warfare, NFG-gate 4th fix, work-loop hand-off) are validated as *code* but need to play out again from scratch in BN4.2 before they're re-confirmed as live behavior in this instance.
-
-### Next session
-- Watch the BN4.2 karma grind reach gang creation again, then Territory Warfare/NFG-gate/backdoor-allowlist/augment-donation behavior re-play out as expected.
-- After BN4.2, one more clear needed for SF4.3.
-
-**Commits**: none (docs/memory only)
-
----

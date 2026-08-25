@@ -1,3 +1,25 @@
+## Session: 2026-08-16 — BN4 cleared for real (SF4.1), replay started (BN4.2), crime-loop's fresh-BitNode-entry RAM race confirmed
+
+**Focus**: No code changes — a play/BitNode-transition session. Confirm BN4's real clear, decide the next move, and re-verify the post-restart crime fallback against a genuine fresh BitNode entry rather than just an augment-install reset.
+
+### What changed (and why)
+- No game-code changes this session (`git status` clean throughout, nothing to commit or push). All updates were to memory/docs plus routine `dev-watch` housekeeping.
+- **BN4 destroyed for real (not flumed) — SF4.1 obtained.** The automation confirmed live through 2026-08-15 (gang founding, territory warfare, NFG-gate hand-off, post-restart crime) carried the character to a genuine clear.
+- **`crime-loop.ts`'s post-restart RAM-race fallback (`a7bc3e4`, fixed 2026-08-15) re-verified against a true fresh BitNode entry** — untested before, since a BitNode entry resets home RAM to 32GB while an augment install leaves RAM/cores intact. Two `ps` snapshots (immediately after restart, then after `home-ram-loop.js`'s first 32GB→64GB purchase) confirmed the delay was a real but self-resolving RAM race, not a bug — `crime-loop.js` and 3 other `[gated ≥ 64GB]` scripts all joined the instant the threshold cleared.
+
+### Decisions
+- **Replay BN4 two more times (now in BN4.2) before moving to BN6/BN7**, per `[[bitburner_bitnode_route]]`'s researched order — staying at SF4.1 means every future BitNode pays a 16x RAM tax on this repo's entirely `ns.singularity.*`/`ns.gang.*`-based automation stack. Since the automation is already proven end-to-end, each replay should be mostly hands-off.
+
+### Issues / surprises
+- A fresh BitNode entry resets all in-playthrough state (karma, gang, augmentations) even though Source-Files persist — so the 2026-08-15 live confirmations (Territory Warfare, NFG-gate 4th fix, work-loop hand-off) are validated as *code* but need to play out again from scratch in BN4.2 before they're re-confirmed as live behavior in this instance.
+
+### Next session
+- Watch the BN4.2 karma grind reach gang creation again, then Territory Warfare/NFG-gate/backdoor-allowlist/augment-donation behavior re-play out as expected.
+- After BN4.2, one more clear needed for SF4.3.
+
+**Commits**: none (docs/memory only)
+
+---
 ## Session: 2026-08-15 — Territory Warfare power growth researched + implemented, NFG-gate 4th fix confirmed live, post-restart crime fallback fixed
 
 **Focus**: Research and implement gang power growth via territory warfare, then diagnose and fix two more live-reported bugs using the `diagnose-loop-bug` pattern.
