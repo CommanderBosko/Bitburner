@@ -1,3 +1,28 @@
+## Session: 2026-08-16 (later) — full skill-audit sweep, 3-phase fix-it pass
+
+**Focus**: Run `/skill-audit` cold across all 14 project-local skills, then implement the findings in priority order (correctness bugs → cross-cutting de-dup → per-lens UX).
+
+### What changed (and why)
+- 5-agent parallel sweep covered all 14 skills against the standard rubric; 6 came back clean (`boot-chain`, `build-check`, `check-unlock`, `dev-watch`, `ns-cost-lookup`, `position-tail-window`).
+- **Phase 1** (`3631a2c`) — 5 correctness bugs, all verified against live output: `activate-check`/`new-worker-script` both misdescribed real boot-chain/dispatch topology; `diagnose-loop-bug`'s own hot-files list had already drifted from the memory note it cites; `secret-scan`'s commit-count claim was stale; `ram-audit` didn't document that its collision-detection is blind to excluded namespaces (the exact gap behind the earlier `corp-manager.ts`/`hasWarehouse` miss).
+- **Phase 2** (`e0160ec`) — extracted the `LAUNCH_BLOCK`/retry-constant template, previously hand-synced between `new-background-loop` and `reorder-chain-launch`, into a real shared asset (`chain-launch-block.ts`); collapsed the `ram-audit`/`ram-costs-refresh` excluded-namespace-list triplication to point at `ram-costs.json`'s `__note__`; added a real `AskUserQuestion` gate to `ram-costs-refresh`'s bulk-edit step.
+- **Phase 3** (`37c2725`) — extracted `diagnose-loop-bug`'s naming-guess-then-fallback grep into `scripts/find-decision-function.sh`, verified against a guess-hit and two guess-misses (including a newly-found one on `augment-loop.ts`); added its `## Arguments` section.
+
+### Decisions
+- Reversed a 2026-08-10 call that had scaled back the `LAUNCH_BLOCK` fix to "sync copies + comments" because a real shared asset seemed too risky given `scaffold-loop.sh`'s sed-corruption history — this time got the real de-dup by only touching comments, never the generation logic itself, then proved it safe with a live scratch-clone smoke test.
+- Deliberately left `new-background-loop/assets/loop-template.ts`'s own stale marker-comment topology unfixed — a clean fix needs the same corruption-prone sed logic touched, for a transient/self-clearing comment; not worth the risk this pass.
+
+### Issues / surprises
+- The scratch-clone smoke test briefly ran against the **real repo** instead of the clone — `scaffold-loop.sh` resolves its target root via `git rev-parse --show-toplevel` off the caller's shell cwd, not the script's own path. Caught immediately via `git status --short` before anything was staged; reverted cleanly and re-ran correctly scoped. Saved as a memory gotcha ([[bitburner_scaffold_loop_scratch_test_gotcha]]) so a future edit to this script doesn't repeat it.
+
+### Next session
+- No open skill-audit work — all findings from this sweep are resolved except the deliberately-deferred `loop-template.ts` marker text (low priority; fold into the next `scaffold-loop.sh` change that's already touching its sed logic).
+- Next full skill-audit sweep whenever more skills accumulate or enough time passes.
+
+**Commits**: `d0dc13a..37c2725` (3 commits this session: `3631a2c`, `e0160ec`, `37c2725`)
+
+---
+
 ## Session: 2026-08-16 — BN4 cleared for real (SF4.1), replay started (BN4.2), crime-loop's fresh-BitNode-entry RAM race confirmed
 
 **Focus**: No code changes — a play/BitNode-transition session. Confirm BN4's real clear, decide the next move, and re-verify the post-restart crime fallback against a genuine fresh BitNode entry rather than just an augment-install reset.

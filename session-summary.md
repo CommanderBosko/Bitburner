@@ -1,3 +1,29 @@
+## Session: 2026-08-25 — real root cause of the "equipment gate not working" symptom: RAM starvation, not the gate
+
+**Focus**: Two `diagnose-loop-bug` runs chasing gang-manager Territory Warfare complaints — the first was a false alarm, the second found and fixed a real RAM-starvation bug hiding behind yesterday's equipment-gate change.
+
+### What changed (and why)
+- **False alarm (no commit)** — user reported Territory Warfare not resuming after full equipment purchase. Traced `wantPowerGrowth`'s four gates against user-reported respect/equipment state: both `!wantRespect` and `!hasUnownedEquipment` were legitimately still unsatisfied (respect below threshold, Augmentation tab specifically not yet checked). Correct behavior, not a bug — documented as a false-alarm precedent in memory.
+- **`2f69601`** — very next report was the opposite symptom: members stuck on Territory Warfare *despite owning no equipment*. Hand-traced a live `gang-state.json` paste against the gate logic and confirmed it computes correctly — the bug wasn't there. Root cause: `controller.ts`'s `currentReserveGb()` never reserved RAM for the *transient* `gang-agent-*.js` workers `gang-manager.ts` dispatches once running, so `gang-agent-status.js` (~21GB, the largest) permanently failed to dispatch, wedging the loop in its stale-report branch before it ever reached the decision code. Added `gangAgentWorkerReserveGb()`, reserving `max(status-alone, every action-worker summed)` — the two dispatch shapes the loop actually produces per tick.
+- **Found, not fixed**: `report.respectForNextRecruitThreshold` is `null` once a gang hits its member cap, so `wantRespect`'s comparison (`respect < threshold`) evaluates `1 < null` → `false` via JS coercion, sticking `wantRespect` permanently false at cap regardless of real respect.
+
+### Decisions
+- Required a live `gang-state.json` paste before patching a second time, rather than guessing again from static code — hand-tracing real data is what separated "gate logic bug" from "gate logic never runs."
+- Reserved `max(status, action-workers-summed)`, not the sum of all six worker scripts — only one of two dispatch shapes ever fires per tick, so summing everything would over-reserve.
+- Deferred the member-cap respect bug rather than patching it mid-diagnosis — no researched at-cap respect target exists yet, and it wasn't this session's active symptom.
+
+### Issues / surprises
+- The equipment-gate fix from yesterday (`c8fc5ab`) was correct all along; the visible symptom two sessions in a row was actually the same underlying RAM-starvation bug class as the earlier `scan-root.js` fix, just never extended to gang-manager's own worker fleet after its 2026-08-10 orchestrator/worker split.
+
+### Next session
+- Confirm members actually switch off Territory Warfare onto a money task now (dispatch itself is confirmed fixed; task reassignment wasn't directly re-checked).
+- Fix the `respectForNextRecruitThreshold === null` member-cap bug — needs a real at-cap respect target first.
+- BN4.3 items carried forward unchanged (karma HUD window position, backdoor-loop `w0r1d_d43m0n` trigger, territory-warfare threshold, NFG-donation branch — all still unconfirmed live).
+
+**Commits**: `d398077..2f69601` (1 commit this session: `2f69601`)
+
+---
+
 ## Session: 2026-08-24 — gang-manager earns money for equipment before committing to Territory Warfare
 
 **Focus**: User-directed fix — the gang should keep working money-earning tasks until every current member is fully equipped, only then switch to Territory Warfare, instead of jumping to territory the moment respect is capped.
@@ -96,31 +122,6 @@ _Older entries are in [session-summary-archive.md](session-summary-archive.md)._
 - BN4.2 already has a gang and trillions in cash — confirm `ef74360`/`c308cad` are firing if not already observed.
 
 **Commits**: `05f1053..24d82d4` (6 commits this session: `d34cdd8`, `406ca73`, `3e17746`, `e0a8ce3`, `6dca5e6`, `24d82d4`)
-
----
-
-## Session: 2026-08-16 (later) — full skill-audit sweep, 3-phase fix-it pass
-
-**Focus**: Run `/skill-audit` cold across all 14 project-local skills, then implement the findings in priority order (correctness bugs → cross-cutting de-dup → per-lens UX).
-
-### What changed (and why)
-- 5-agent parallel sweep covered all 14 skills against the standard rubric; 6 came back clean (`boot-chain`, `build-check`, `check-unlock`, `dev-watch`, `ns-cost-lookup`, `position-tail-window`).
-- **Phase 1** (`3631a2c`) — 5 correctness bugs, all verified against live output: `activate-check`/`new-worker-script` both misdescribed real boot-chain/dispatch topology; `diagnose-loop-bug`'s own hot-files list had already drifted from the memory note it cites; `secret-scan`'s commit-count claim was stale; `ram-audit` didn't document that its collision-detection is blind to excluded namespaces (the exact gap behind the earlier `corp-manager.ts`/`hasWarehouse` miss).
-- **Phase 2** (`e0160ec`) — extracted the `LAUNCH_BLOCK`/retry-constant template, previously hand-synced between `new-background-loop` and `reorder-chain-launch`, into a real shared asset (`chain-launch-block.ts`); collapsed the `ram-audit`/`ram-costs-refresh` excluded-namespace-list triplication to point at `ram-costs.json`'s `__note__`; added a real `AskUserQuestion` gate to `ram-costs-refresh`'s bulk-edit step.
-- **Phase 3** (`37c2725`) — extracted `diagnose-loop-bug`'s naming-guess-then-fallback grep into `scripts/find-decision-function.sh`, verified against a guess-hit and two guess-misses (including a newly-found one on `augment-loop.ts`); added its `## Arguments` section.
-
-### Decisions
-- Reversed a 2026-08-10 call that had scaled back the `LAUNCH_BLOCK` fix to "sync copies + comments" because a real shared asset seemed too risky given `scaffold-loop.sh`'s sed-corruption history — this time got the real de-dup by only touching comments, never the generation logic itself, then proved it safe with a live scratch-clone smoke test.
-- Deliberately left `new-background-loop/assets/loop-template.ts`'s own stale marker-comment topology unfixed — a clean fix needs the same corruption-prone sed logic touched, for a transient/self-clearing comment; not worth the risk this pass.
-
-### Issues / surprises
-- The scratch-clone smoke test briefly ran against the **real repo** instead of the clone — `scaffold-loop.sh` resolves its target root via `git rev-parse --show-toplevel` off the caller's shell cwd, not the script's own path. Caught immediately via `git status --short` before anything was staged; reverted cleanly and re-ran correctly scoped. Saved as a memory gotcha ([[bitburner_scaffold_loop_scratch_test_gotcha]]) so a future edit to this script doesn't repeat it.
-
-### Next session
-- No open skill-audit work — all findings from this sweep are resolved except the deliberately-deferred `loop-template.ts` marker text (low priority; fold into the next `scaffold-loop.sh` change that's already touching its sed logic).
-- Next full skill-audit sweep whenever more skills accumulate or enough time passes.
-
-**Commits**: `d0dc13a..37c2725` (3 commits this session: `3631a2c`, `e0160ec`, `37c2725`)
 
 ---
 
