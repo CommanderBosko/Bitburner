@@ -13,6 +13,25 @@ const SERVER_TREE_SCRIPT = "scripts/server-tree.js";
 const RESCAN_LOOP_SCRIPT = "scripts/rescan-loop.js";
 const SCAN_ROOT_SCRIPT = "scripts/scan-root.js";
 const GANG_MANAGER_SCRIPT = "scripts/gang-manager.js";
+// Transient workers gang-manager.js itself dispatches via ns.exec once it's already running (see
+// that file's 2026-08-10 RAM-split comment) - gangReserveGb/lowerPriorityReserveGb below only
+// ever reserved gang-manager.js's OWN ~3.60GB resident cost, and only until it launches; nothing
+// reserved room for THESE once it's up, so dispatch's greedy hack/grow/weaken fill could (and
+// did, confirmed live 2026-08-25) claim every last free GB of home between gang-manager.js's
+// ticks, leaving gang-agent-status.js - by far the biggest at ~21GB, since it's the one that
+// bears almost the whole ns.gang.* read cost per that same split - permanently failing to
+// dispatch ("couldn't dispatch ... check RAM"). With status refresh wedged, gang-manager.js's
+// `if (!report || isStale) { dispatch status; continue; }` branch never falls through to
+// computeTaskAssignments/computeEquipmentPurchases/computeWarfareDecision at all, so members sat
+// frozen on whatever task they'd last been assigned - same failure class as
+// [[bitburner_scan_root_ram_starvation]], just never extended to gang-manager.js's own worker
+// fleet after that refactor.
+const GANG_AGENT_STATUS_SCRIPT = "scripts/gang-agent-status.js";
+const GANG_AGENT_RECRUIT_SCRIPT = "scripts/gang-agent-recruit.js";
+const GANG_AGENT_ASCEND_SCRIPT = "scripts/gang-agent-ascend.js";
+const GANG_AGENT_ASSIGN_TASK_SCRIPT = "scripts/gang-agent-assign-task.js";
+const GANG_AGENT_BUY_EQUIPMENT_SCRIPT = "scripts/gang-agent-buy-equipment.js";
+const GANG_AGENT_WARFARE_SCRIPT = "scripts/gang-agent-warfare.js";
 // BN4 Singularity automation, hardcoded for a BN4 context (2026-08-09, user-directed - see
 // [[bitburner_bn4_singularity]]): every script here wraps its ns.singularity.* calls in
 // try/catch + a long backoff (see each script's own SINGULARITY_UNAVAILABLE_RETRY_MS). A
@@ -330,6 +349,24 @@ function reserveIfAffordable(ns: NS, script: string): number {
 	return cost < ns.getServerMaxRam("home") ? cost : 0;
 }
 
+// gang-manager.ts dispatches exactly one of two shapes per tick, never both: either
+// gang-agent-status.js alone (report refresh) or some subset of
+// recruit/ascend/assign-task/buy-equipment/warfare together (a decision tick, gated on a fresh
+// report). Reserve the larger of "status alone" vs. "every action worker at once" so whichever
+// shape actually fires this tick always has room, regardless of which one it turns out to be.
+function gangAgentWorkerReserveGb(ns: NS): number {
+	if (!ns.isRunning(GANG_MANAGER_SCRIPT, "home")) return 0;
+	const statusCostGb = ns.getScriptRam(GANG_AGENT_STATUS_SCRIPT, "home");
+	const actionWorkerCostGb = [
+		GANG_AGENT_RECRUIT_SCRIPT,
+		GANG_AGENT_ASCEND_SCRIPT,
+		GANG_AGENT_ASSIGN_TASK_SCRIPT,
+		GANG_AGENT_BUY_EQUIPMENT_SCRIPT,
+		GANG_AGENT_WARFARE_SCRIPT,
+	].reduce((sum, script) => sum + ns.getScriptRam(script, "home"), 0);
+	return Math.max(statusCostGb, actionWorkerCostGb);
+}
+
 function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 	const rescanLoopReserveGb = ns.isRunning(RESCAN_LOOP_SCRIPT, "home") ? 0 : ns.getScriptRam(RESCAN_LOOP_SCRIPT, "home");
 	const scanRootReserveGb = ns.isRunning(SCAN_ROOT_SCRIPT, "home") ? 0 : ns.getScriptRam(SCAN_ROOT_SCRIPT, "home");
@@ -340,6 +377,12 @@ function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 			if (!ns.isRunning(script, "home")) lowerPriorityReserveGb += ns.getScriptRam(script, "home");
 		}
 	}
+	// Additive on top of lowerPriorityReserveGb above, not a replacement: that reserve covers
+	// gang-manager.js's own ~3.60GB resident cost (and only until it launches - once running, its
+	// cost is already reflected in ns.getServerUsedRam so that term drops to 0). This one instead
+	// covers the transient gang-agent-*.js workers it dispatches at runtime, and only matters
+	// once gang-manager.js IS running (see gangAgentWorkerReserveGb's own isRunning guard).
+	const gangAgentReserveGb = gangAgentWorkerReserveGb(ns);
 	let bn4SingularityReserveGb = 0;
 	for (const script of BN4_SINGULARITY_SCRIPTS) {
 		bn4SingularityReserveGb += reserveIfAffordable(ns, script);
@@ -361,6 +404,7 @@ function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 		serverTreeReserveGb +
 		serverPurchaseManagerReserveGb +
 		lowerPriorityReserveGb +
+		gangAgentReserveGb +
 		bn4SingularityReserveGb +
 		workLoopReserveGb
 	);
