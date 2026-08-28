@@ -1,3 +1,34 @@
+## Session: 2026-08-17/18 — NFG-gate family's 4th and 5th fixes, territory-warfare threshold override, crime-loop focus flip-flop
+
+_Older entries are in [session-summary-archive.md](session-summary-archive.md)._
+
+**Focus**: Root-cause a recurring "grinding pointless Sector-12 rep" symptom via `diagnose-loop-bug` (twice — it had two independent causes), plus three smaller user-directed changes: gang territory-warfare's engage threshold, `crime-loop.ts`'s `focus` flag (twice), and two new custom agents.
+
+### What changed (and why)
+- **`6dca5e6`** — `augment-loop.ts`: NeuroFlux Governor made a valid donation target once nothing real is left to buy (4th fix on the NFG-gate family). Live tail had shown budget climb $901K → $1.42T over dozens of ticks with `donated=$0` throughout — money was piling up idle while the only path to close NFG's rep gap was the slow work-grind.
+- **`24d82d4`** — `faction-work-loop.ts`: excluded NFG from `orderFactionsByAugmentGap` entirely (5th fix, and the *actual* root cause) — NFG's own rep gap kept a zero-real-augs faction like Sector-12 permanently in contention as the work target, since its gap never hit `Infinity`. The 4th fix above was necessary but not sufficient; this one closed it for real. Confirmed live: Sector-12 rep flat, BitRunners (3 real augs) picked up instead, money $694.865b → $2.079t in under an hour.
+- **`e0a8ce3`** — gang-manager's territory-warfare engage/disengage hysteresis: 65%/55% → 99.5%/99% (user-directed override of the 2026-08-15 research default).
+- **`d34cdd8`** then **`3e17746`** — `crime-loop.ts`'s `commitCrime` focus flag: `false` → `true` (early-game karma grind should focus, user-directed) → back to `false` a day later (no reason given).
+- **`406ca73`** — scaffolded `loop-bug-investigator` (project-local agent, fan-out unit for `diagnose-loop-bug`) and a global `transcript-scanner` agent (NixOS repo) from a corpus-wide log-mining pass.
+- No-commit: `/dev-watch`'s `sync: running` status was a stale-PID false positive — the real `bitburner-filesync` had died and the OS recycled its PID onto `tsc -w`'s child. Fixed with a clean stop/start.
+
+### Decisions
+- Chose 99.5%/99.0% over a literal `winChance === 1` check for territory-warfare engagement, since `getChanceToWinClash()` only hits exactly 1 when a rival's power is literally zero — which won't happen while any rival holds territory.
+- Flagged `crime-loop.ts`'s `focus` flag for a 3rd-flip "ask why" rule rather than just toggling again — two content-free reversals suggests the real want is something else (situational toggle?).
+
+### Issues / surprises
+- The NFG-gate family now has 5 fixes across two files (`augment-loop.ts`, `faction-work-loop.ts`) for what looks like the same user-facing symptom each time — the 4th fix (donation eligibility) looked complete but didn't touch the actual root cause, which was one layer up in work-*target selection*, not spend eligibility.
+- `dev-watch.sh status`'s `kill -0` liveness check can false-positive after PID reuse — worth hardening if it recurs (see memory).
+
+### Next session
+- Watch territory-warfare actually engage at ~99.5% against a real rival gang.
+- Watch `augment-loop.ts`'s NFG-donation branch fire once a faction's favor crosses ~150.
+- BN4.2 already has a gang and trillions in cash — confirm `ef74360`/`c308cad` are firing if not already observed.
+
+**Commits**: `05f1053..24d82d4` (6 commits this session: `d34cdd8`, `406ca73`, `3e17746`, `e0a8ce3`, `6dca5e6`, `24d82d4`)
+
+---
+
 ## Session: 2026-08-16 (later) — full skill-audit sweep, 3-phase fix-it pass
 
 **Focus**: Run `/skill-audit` cold across all 14 project-local skills, then implement the findings in priority order (correctness bugs → cross-cutting de-dup → per-lens UX).

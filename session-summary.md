@@ -1,3 +1,32 @@
+## Session: 2026-08-28 — `/improve-system` sweep: 2 new skills, 1 hardened, permission allowlist, 3 clean passes
+
+_Older entries are in [session-summary-archive.md](session-summary-archive.md)._
+
+**Focus**: Run all six `/improve-system` sub-skills in one pass — skill-upgrade, skill-suggestion, agent-suggestion, claude-rules, skill-audit, fewer-permission-prompts — auto-applying low-risk additive fixes and confirming structural ones.
+
+### What changed (and why)
+- **skill-upgrade** — new Gotcha on `diagnose-loop-bug` (Step 7's memory-file update can chain two stale `Edit`s: a body edit succeeds, then a frontmatter `modified:`-timestamp edit fails because its `old_string` predates the first edit). Traced from two real "String to replace not found" failures via full tool-call sequencing, not just the error string.
+- **skill-suggestion** — full-history transcript mining (3 parallel `transcript-scanner` agents) found two real reuse candidates, both built: `sync-verify` (confirms a specific edited script's compiled output actually synced into the game, closing a gap `build-check`'s shallow liveness check doesn't cover) and `ship-fix` (chains `build-check` → `commit-and-push` for ordinary source fixes). Both smoke-tested live before the commit.
+- **fewer-permission-prompts** — 6 verified read-only patterns added to a new `.claude/settings.json`; `ssh`/`virsh`/interpreters explicitly excluded despite high frequency (see Decisions).
+- **agent-suggestion, claude-rules, skill-audit** — all three came back clean (full 130-transcript agent-spawn tally, all 5 standing rules present, 14/14 skills audited with 0 findings).
+
+### Decisions
+- Built `sync-verify` as a standalone companion to `build-check` rather than extending `build-check` itself — different cost/depth trade-off (cheap liveness check vs. deep per-file forensic check), better kept separate.
+- Classified `ship-fix` as judgment-tier (no pinned `model:`), unlike `commit-and-push`'s `haiku` pin — it has a genuine judgment step (memory-doc-needed decision) `commit-and-push` doesn't.
+- Excluded `ssh`/`virsh` from the permission allowlist despite 53x/33x transcript frequency — `ssh` is explicitly named as a shell-exec-equivalent in the skill's own rules; `virsh`'s uses mixed read-only and mutating subcommands (and came from a different project's transcripts).
+
+### Issues / surprises
+- None — a genuinely clean sweep on 3 of 6 sub-skills, and the other three completed without any blocking issues.
+
+### Next session
+- Reach for `ship-fix` when shipping an ordinary source fix instead of invoking `build-check`+`commit-and-push` separately; reach for `sync-verify` instead of the ad-hoc sync.log-grep-plus-mtime-compare dance when doubting whether a specific fix actually synced.
+- Everything here is project-local — no NixOS rebuild needed, all live immediately.
+- Gameplay/BitNode state (BN4.3, gang RAM-starvation fix, member-cap respect bug) unchanged this session — see the 2026-08-25 entry below for where that stands.
+
+**Commits**: `c3de00a..ee2b1bb` (1 commit this session: `ee2b1bb`)
+
+---
+
 ## Session: 2026-08-25 — real root cause of the "equipment gate not working" symptom: RAM starvation, not the gate
 
 **Focus**: Two `diagnose-loop-bug` runs chasing gang-manager Territory Warfare complaints — the first was a false alarm, the second found and fixed a real RAM-starvation bug hiding behind yesterday's equipment-gate change.
@@ -91,37 +120,6 @@
 - After BN4.3 lands (SF4.3), move on to BN6+BN7 per `[[bitburner_bitnode_route]]`.
 
 **Commits**: `eef195e..2c41d2f` (1 commit this session: `2c41d2f`)
-
----
-
-## Session: 2026-08-17/18 — NFG-gate family's 4th and 5th fixes, territory-warfare threshold override, crime-loop focus flip-flop
-
-_Older entries are in [session-summary-archive.md](session-summary-archive.md)._
-
-**Focus**: Root-cause a recurring "grinding pointless Sector-12 rep" symptom via `diagnose-loop-bug` (twice — it had two independent causes), plus three smaller user-directed changes: gang territory-warfare's engage threshold, `crime-loop.ts`'s `focus` flag (twice), and two new custom agents.
-
-### What changed (and why)
-- **`6dca5e6`** — `augment-loop.ts`: NeuroFlux Governor made a valid donation target once nothing real is left to buy (4th fix on the NFG-gate family). Live tail had shown budget climb $901K → $1.42T over dozens of ticks with `donated=$0` throughout — money was piling up idle while the only path to close NFG's rep gap was the slow work-grind.
-- **`24d82d4`** — `faction-work-loop.ts`: excluded NFG from `orderFactionsByAugmentGap` entirely (5th fix, and the *actual* root cause) — NFG's own rep gap kept a zero-real-augs faction like Sector-12 permanently in contention as the work target, since its gap never hit `Infinity`. The 4th fix above was necessary but not sufficient; this one closed it for real. Confirmed live: Sector-12 rep flat, BitRunners (3 real augs) picked up instead, money $694.865b → $2.079t in under an hour.
-- **`e0a8ce3`** — gang-manager's territory-warfare engage/disengage hysteresis: 65%/55% → 99.5%/99% (user-directed override of the 2026-08-15 research default).
-- **`d34cdd8`** then **`3e17746`** — `crime-loop.ts`'s `commitCrime` focus flag: `false` → `true` (early-game karma grind should focus, user-directed) → back to `false` a day later (no reason given).
-- **`406ca73`** — scaffolded `loop-bug-investigator` (project-local agent, fan-out unit for `diagnose-loop-bug`) and a global `transcript-scanner` agent (NixOS repo) from a corpus-wide log-mining pass.
-- No-commit: `/dev-watch`'s `sync: running` status was a stale-PID false positive — the real `bitburner-filesync` had died and the OS recycled its PID onto `tsc -w`'s child. Fixed with a clean stop/start.
-
-### Decisions
-- Chose 99.5%/99.0% over a literal `winChance === 1` check for territory-warfare engagement, since `getChanceToWinClash()` only hits exactly 1 when a rival's power is literally zero — which won't happen while any rival holds territory.
-- Flagged `crime-loop.ts`'s `focus` flag for a 3rd-flip "ask why" rule rather than just toggling again — two content-free reversals suggests the real want is something else (situational toggle?).
-
-### Issues / surprises
-- The NFG-gate family now has 5 fixes across two files (`augment-loop.ts`, `faction-work-loop.ts`) for what looks like the same user-facing symptom each time — the 4th fix (donation eligibility) looked complete but didn't touch the actual root cause, which was one layer up in work-*target selection*, not spend eligibility.
-- `dev-watch.sh status`'s `kill -0` liveness check can false-positive after PID reuse — worth hardening if it recurs (see memory).
-
-### Next session
-- Watch territory-warfare actually engage at ~99.5% against a real rival gang.
-- Watch `augment-loop.ts`'s NFG-donation branch fire once a faction's favor crosses ~150.
-- BN4.2 already has a gang and trillions in cash — confirm `ef74360`/`c308cad` are firing if not already observed.
-
-**Commits**: `05f1053..24d82d4` (6 commits this session: `d34cdd8`, `406ca73`, `3e17746`, `e0a8ce3`, `6dca5e6`, `24d82d4`)
 
 ---
 
