@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/home/bosko/.claude/skills/session-closer/scripts/scan-session.sh git-changes *)",
+      "Bash(/home/bosko/.claude/skills/git-commit/scripts/git-commit.sh status)",
+      "Bash(/home/bosko/.claude/skills/session-closer/scripts/scan-session.sh transcript *)",
+      "Bash(rtk find *)",
+      "Bash(/home/bosko/NixOS/.claude/skills/nixos-dry-run/scripts/dry-run.sh)",
+      "Bash(nix search *)"
+    ]
+  }
+}
