@@ -264,3 +264,48 @@ export interface DarknetKnowledgeBase {
 	patterns: DarknetLearnedPattern[];
 	metrics: DarknetMetrics;
 }
+
+// Bladeburner report types, written by bladeburner-agent-status.ts and read by
+// bladeburner-manager.ts (2026-08-30) - mirrors the gang-manager.ts/gang-agent-status.ts split
+// (see GangStateReport above): almost every ns.bladeburner.* read costs 4GB each, which would put
+// a monolithic script in the same ~60GB+ range gang-manager.ts hit before its 2026-08-10 split, so
+// this repo goes straight to the orchestrator+worker shape instead of discovering the same
+// RAM-starvation bug a third time. bladeburner-manager.ts's own decisions are pure functions over
+// this cached report - no ns.bladeburner.* calls in that file itself.
+export interface BladeburnerActionCandidate {
+	name: string;
+	// [min, max] from getActionEstimatedSuccessChance - kept as two fields (not a tuple) since this
+	// gets JSON round-tripped through a file, same flattening approach as GangTaskSnapshot's
+	// territoryMoneyExp/territoryRespectExp above.
+	successChanceMin: number;
+	successChanceMax: number;
+	countRemaining: number;
+}
+
+export interface BladeburnerSkillSnapshot {
+	name: string;
+	level: number;
+	upgradeCost: number;
+}
+
+export interface BladeburnerCurrentAction {
+	type: string;
+	name: string;
+}
+
+export interface BladeburnerStateReport {
+	rank: number;
+	skillPoints: number;
+	staminaCurrent: number;
+	staminaMax: number;
+	city: string;
+	cityChaos: number;
+	currentAction: BladeburnerCurrentAction | null;
+	nextBlackOp: { name: string; rank: number } | null;
+	// null if nextBlackOp itself is null (nothing left to compute a chance for).
+	nextBlackOpSuccessChanceMin: number | null;
+	contracts: BladeburnerActionCandidate[];
+	operations: BladeburnerActionCandidate[];
+	skills: BladeburnerSkillSnapshot[];
+	writtenAt: number;
+}

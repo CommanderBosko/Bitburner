@@ -74,15 +74,26 @@ function findMemberLine(stripped, start, end, leafName) {
 }
 
 function extractRamCost(originalLines, signatureLine) {
-  // Walk upward through contiguous comment lines (blank lines allowed to be skipped
-  // once) immediately above the signature, collecting them, then search for a
-  // "RAM cost: X GB" line in either documented form.
+  // Walk upward through contiguous comment lines immediately above the signature,
+  // collecting them, then search for a "RAM cost: X GB" line in either documented
+  // form. Tolerates exactly one stray blank line inside an otherwise-contiguous JSDoc
+  // block - confirmed 2026-08-30 that singularity.gymWorkout's doc comment has one
+  // between its "RAM cost: 2 GB * 16/4/1" line and the rest of the description, which
+  // used to stop this walk before ever reaching the RAM cost line at all. More than
+  // one blank line in a row means the walk has actually left the comment block (e.g.
+  // reached the gap before the previous member's own doc block), so it still stops.
   let i = signatureLine - 1;
   const commentLines = [];
+  let skippedBlank = false;
   while (i >= 0) {
     const line = originalLines[i];
     if (/^\s*(\*|\/\*|\/\/)/.test(line) || /\*\/\s*$/.test(line)) {
       commentLines.unshift(line);
+      i--;
+      continue;
+    }
+    if (/^\s*$/.test(line) && !skippedBlank) {
+      skippedBlank = true;
       i--;
       continue;
     }
@@ -95,7 +106,11 @@ function extractRamCost(originalLines, signatureLine) {
   // is what applies before that Source-File is leveled up). Confirmed in-game
   // for singularity.connect (2 * 16 = 32GB, matching `mem connect-to.js`).
   const m = /RAM cost:\s*([\d.]+)\s*(?:GB)?\s*(?:\*\s*(\d+)\s*\/\s*\d+\s*\/\s*\d+)?/i.exec(block);
-  if (!m) return { found: block.length > 0, cost: null, scaled: false };
+  // found means "a RAM cost line was actually parsed", not just "some comment text was
+  // captured" - the latter (the old block.length > 0 check) let a real-but-missed "RAM cost:"
+  // line report status "found" with cost: null, which then crashed main()'s
+  // `result.cost.toFixed(2)` on singularity.gymWorkout before the blank-line fix above existed.
+  if (!m) return { found: false, cost: null, scaled: false };
   const base = Number.parseFloat(m[1]);
   const multiplier = m[2] ? Number.parseFloat(m[2]) : 1;
   return { found: true, cost: base * multiplier, scaled: Boolean(m[2]) };

@@ -62,6 +62,26 @@ const BACKDOOR_LOOP_SCRIPT = "scripts/backdoor-loop.js";
 const COMPANY_WORK_LOOP_SCRIPT = "scripts/company-work-loop.js";
 const FACTION_WORK_LOOP_SCRIPT = "scripts/faction-work-loop.js";
 const CRIME_LOOP_SCRIPT = "scripts/crime-loop.js";
+// bladeburner-stat-loop.ts/bladeburner-manager.js (2026-08-30) - two more work-loop group members,
+// added once BN4.3/SF4.3 landed and BN6.1 started (see [[bitburner_bn67_bladeburner]]). Bladeburner
+// actions and Singularity work (crime/faction/company) share the same underlying exclusivity (Blade's
+// Simulacrum, a BN7-only reward, is what removes that lock - not owned yet on this save), so both
+// belong in this same group, not alongside augment-loop.js. bladeburner-stat-loop.ts trains combat
+// stats via the gym until joinBladeburnerDivision()'s own requirement (all four >= 100) is met -
+// nothing else in this chain does that once crime-loop.js stops post-gang - and hands off to
+// bladeburner-manager.js once hasBladeburnerCombatStats(ns) passes (see decideActiveWorkScript).
+const BLADEBURNER_STAT_LOOP_SCRIPT = "scripts/bladeburner-stat-loop.js";
+const BLADEBURNER_LOOP_SCRIPT = "scripts/bladeburner-manager.js";
+// bladeburner-manager.js's own transient workers - see bladeburnerAgentWorkerReserveGb below,
+// same reservation shape as gang-manager.js's gang-agent-*.js fleet.
+const BLADEBURNER_AGENT_STATUS_SCRIPT = "scripts/bladeburner-agent-status.js";
+const BLADEBURNER_AGENT_JOIN_SCRIPT = "scripts/bladeburner-agent-join.js";
+const BLADEBURNER_AGENT_START_ACTION_SCRIPT = "scripts/bladeburner-agent-start-action.js";
+const BLADEBURNER_AGENT_UPGRADE_SKILL_SCRIPT = "scripts/bladeburner-agent-upgrade-skill.js";
+// Sole writer is bladeburner-agent-status.ts - read here only for isBladeburnerProductive's cheap
+// (ns.read, no ns.bladeburner.* cost) grace-period check, matching how this file already reads
+// /data/servers.json and /data/ram-demand.json without adding to its own resident RAM cost.
+const BLADEBURNER_STATE_PATH = "/data/bladeburner-state.json";
 // augment-loop.js (28.10GB live) is launched by the same block but isn't part of the
 // exclusivity group - purchasing/installing augmentations doesn't touch the shared work slot, so
 // it runs unconditionally alongside whichever of crime/faction/company is active. It only starts
@@ -119,19 +139,69 @@ const FACTION_GRACE_MS = 90000;
 // pre-gang karma-grinding) - sits between FACTION_GRACE_MS and FACTION_PROBE_INTERVAL_MS.
 const POST_RESTART_CRIME_GRACE_MS = 180000;
 
+// joinBladeburnerDivision()'s own documented requirement (all four combat stats >= 100). Mirrors
+// bladeburner-stat-loop.ts's own BLADEBURNER_STAT_TARGET constant - kept as a separate literal
+// here rather than shared/imported, matching this file's existing convention of duplicating small
+// script-specific literals (e.g. BLADEBURNER_STATE_PATH above) rather than centralizing them.
+const BLADEBURNER_JOIN_STAT_TARGET = 100;
+
+function hasBladeburnerCombatStats(ns: NS): boolean {
+	const skills = ns.getPlayer().skills;
+	return (
+		skills.strength >= BLADEBURNER_JOIN_STAT_TARGET &&
+		skills.defense >= BLADEBURNER_JOIN_STAT_TARGET &&
+		skills.dexterity >= BLADEBURNER_JOIN_STAT_TARGET &&
+		skills.agility >= BLADEBURNER_JOIN_STAT_TARGET
+	);
+}
+
+// Cheap (ns.read only, no ns.bladeburner.* reference) signal for whether bladeburner-manager.js is
+// currently doing real Bladeburner work (a Contract/Operation/Black Operation) vs. idling in a
+// General fallback (recovering stamina, reducing chaos, or Field Analysis when nothing qualifies) -
+// same role the getCurrentWork().type === "FACTION" check below plays for faction-work-loop.js.
+// Defaults to true (assume productive / keep trying) when the report is missing, stale, or
+// unparseable, matching that same check's "can't tell, don't assume failure" fallback.
+function isBladeburnerProductive(ns: NS): boolean {
+	if (!ns.fileExists(BLADEBURNER_STATE_PATH, "home")) return true;
+	const raw = ns.read(BLADEBURNER_STATE_PATH);
+	if (!raw) return true;
+	try {
+		const report = JSON.parse(raw) as { currentAction: { type: string } | null };
+		return report.currentAction !== null && report.currentAction.type !== "General";
+	} catch {
+		return true;
+	}
+}
+
 function decideActiveWorkScript(ns: NS): string {
 	if (!ns.gang.inGang() || Date.now() - CONTROLLER_STARTED_AT < POST_RESTART_CRIME_GRACE_MS) return CRIME_LOOP_SCRIPT;
+	// Combat stats aren't there yet for joinBladeburnerDivision() - train instead of considering
+	// bladeburner-manager.js at all (see bladeburner-stat-loop.ts). Nothing else in this chain
+	// trains combat stats once crime-loop.js stops post-gang.
+	if (!hasBladeburnerCombatStats(ns)) return BLADEBURNER_STAT_LOOP_SCRIPT;
 
 	const now = Date.now();
 	if (activeWorkScript === COMPANY_WORK_LOOP_SCRIPT) {
 		return now - lastWorkTransitionAt > FACTION_PROBE_INTERVAL_MS ? FACTION_WORK_LOOP_SCRIPT : COMPANY_WORK_LOOP_SCRIPT;
 	}
 
+	// Bladeburner ranks below faction (augment rep gaps remain this save's highest-value lever) but
+	// above company (money is rarely the bottleneck once a gang exists) - see
+	// [[bitburner_bn67_bladeburner]] for the reasoning. Same grace/probe timers as the
+	// faction<->company pair below: give a freshly-switched-to bladeburner-manager.js
+	// FACTION_GRACE_MS before judging it unproductive, and periodically give faction another shot
+	// after FACTION_PROBE_INTERVAL_MS regardless.
+	if (activeWorkScript === BLADEBURNER_LOOP_SCRIPT) {
+		if (now - lastWorkTransitionAt > FACTION_PROBE_INTERVAL_MS) return FACTION_WORK_LOOP_SCRIPT;
+		if (now - lastWorkTransitionAt > FACTION_GRACE_MS && !isBladeburnerProductive(ns)) return COMPANY_WORK_LOOP_SCRIPT;
+		return BLADEBURNER_LOOP_SCRIPT;
+	}
+
 	if (activeWorkScript === FACTION_WORK_LOOP_SCRIPT && now - lastWorkTransitionAt > FACTION_GRACE_MS) {
 		try {
 			const currentWork = ns.singularity.getCurrentWork();
 			const workingForFaction = currentWork !== null && currentWork.type === "FACTION";
-			if (!workingForFaction) return COMPANY_WORK_LOOP_SCRIPT;
+			if (!workingForFaction) return BLADEBURNER_LOOP_SCRIPT;
 		} catch {
 			// Singularity unavailable - can't tell if faction work is actually happening; keep
 			// trying faction rather than assume failure.
@@ -367,6 +437,23 @@ function gangAgentWorkerReserveGb(ns: NS): number {
 	return Math.max(statusCostGb, actionWorkerCostGb);
 }
 
+// Mirrors gangAgentWorkerReserveGb above for bladeburner-manager.js's own worker fleet. Slightly
+// more conservative than a perfectly tight bound: the join worker can, in one specific case
+// (division already joined but the Bladeburners faction not yet, requiring Rank>=25 - see
+// bladeburner-manager.ts's own comment), be dispatched in the same tick as an action/skill worker,
+// so it's summed into the "decision tick" shape here rather than excluded the way
+// gang-agent-found.ts is excluded above (that script's dispatch is always time-disjoint from gang's
+// action workers).
+function bladeburnerAgentWorkerReserveGb(ns: NS): number {
+	if (!ns.isRunning(BLADEBURNER_LOOP_SCRIPT, "home")) return 0;
+	const statusCostGb = ns.getScriptRam(BLADEBURNER_AGENT_STATUS_SCRIPT, "home");
+	const decisionTickCostGb = [BLADEBURNER_AGENT_JOIN_SCRIPT, BLADEBURNER_AGENT_START_ACTION_SCRIPT, BLADEBURNER_AGENT_UPGRADE_SKILL_SCRIPT].reduce(
+		(sum, script) => sum + ns.getScriptRam(script, "home"),
+		0,
+	);
+	return Math.max(statusCostGb, decisionTickCostGb);
+}
+
 function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 	const rescanLoopReserveGb = ns.isRunning(RESCAN_LOOP_SCRIPT, "home") ? 0 : ns.getScriptRam(RESCAN_LOOP_SCRIPT, "home");
 	const scanRootReserveGb = ns.isRunning(SCAN_ROOT_SCRIPT, "home") ? 0 : ns.getScriptRam(SCAN_ROOT_SCRIPT, "home");
@@ -383,6 +470,7 @@ function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 	// covers the transient gang-agent-*.js workers it dispatches at runtime, and only matters
 	// once gang-manager.js IS running (see gangAgentWorkerReserveGb's own isRunning guard).
 	const gangAgentReserveGb = gangAgentWorkerReserveGb(ns);
+	const bladeburnerAgentReserveGb = bladeburnerAgentWorkerReserveGb(ns);
 	let bn4SingularityReserveGb = 0;
 	for (const script of BN4_SINGULARITY_SCRIPTS) {
 		bn4SingularityReserveGb += reserveIfAffordable(ns, script);
@@ -405,6 +493,7 @@ function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 		serverPurchaseManagerReserveGb +
 		lowerPriorityReserveGb +
 		gangAgentReserveGb +
+		bladeburnerAgentReserveGb +
 		bn4SingularityReserveGb +
 		workLoopReserveGb
 	);
@@ -1119,7 +1208,7 @@ export async function main(ns: NS): Promise<void> {
 			}
 
 			// Work-loop group: mutually exclusive (see decideActiveWorkScript's own comment) -
-			// kill whichever of the three isn't the desired one, then launch the desired one.
+			// kill whichever of the five isn't the desired one, then launch the desired one.
 			// augment-loop.js rides along unconditionally once gang exists (not part of the
 			// exclusivity group).
 			const desiredWorkScript = decideActiveWorkScript(ns);
@@ -1127,7 +1216,7 @@ export async function main(ns: NS): Promise<void> {
 				lastWorkTransitionAt = Date.now();
 				activeWorkScript = desiredWorkScript;
 			}
-			for (const script of [CRIME_LOOP_SCRIPT, FACTION_WORK_LOOP_SCRIPT, COMPANY_WORK_LOOP_SCRIPT]) {
+			for (const script of [CRIME_LOOP_SCRIPT, FACTION_WORK_LOOP_SCRIPT, COMPANY_WORK_LOOP_SCRIPT, BLADEBURNER_STAT_LOOP_SCRIPT, BLADEBURNER_LOOP_SCRIPT]) {
 				if (script !== desiredWorkScript && ns.isRunning(script, "home")) {
 					ns.kill(script, "home");
 				}

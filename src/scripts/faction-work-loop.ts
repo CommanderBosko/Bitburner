@@ -107,6 +107,12 @@ export async function main(ns: NS): Promise<void> {
 			// decideActiveWorkScript) - no cross-script deference needed here, just the
 			// pre-existing same-target dedup below.
 			const currentWork = ns.singularity.getCurrentWork();
+			// "Bladeburners" (joined via ns.bladeburner.joinBladeburnerFaction() in
+			// bladeburner-agent-join.ts, not checkFactionInvitations()/joinFaction() above) lands in
+			// this same array once joined - no special-casing needed here, it's ranked by
+			// orderFactionsByAugmentGap and worked like any other faction below. If it turns out not
+			// to support the "hacking" WORK_TYPE, workForFaction just returns false and this loop
+			// moves on to the next candidate, same as any faction that doesn't offer it.
 			const joined = ns.getPlayer().factions;
 			const owned = new Set(ns.singularity.getOwnedAugmentations(true));
 
