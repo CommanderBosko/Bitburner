@@ -1,6 +1,31 @@
-## Session: 2026-08-28 — `/improve-system` sweep: 2 new skills, 1 hardened, permission allowlist, 3 clean passes
+## Session: 2026-08-30 — BN4.3 complete, BN6.1 (Bladeburner) started; augment/faction RAM split; bladeburner-loop built
 
 _Older entries are in [session-summary-archive.md](session-summary-archive.md)._
+
+**Focus**: BN4.3 finished for real (SF4.3, permanent) and the save moved into BN6.1. Two feature sessions followed: split the last two monolithic work-loop scripts (`augment-loop.ts`/`faction-work-loop.ts`) into orchestrator+worker pairs, and built `bladeburner-loop` as a 4th work-slot rotation candidate.
+
+### What changed (and why)
+- **BitNode transition** — `backdoor-loop.ts`'s `w0r1d_d43m0n` target (wired 2026-08-19) fired for real, destroying BN4 and granting SF4.3 (permanent 1x native Singularity RAM cost forever). Entered BN6.1 same day; researched Bladeburner mechanics via `/research` (8/8 sources) and confirmed Bladeburner is additive to the crime→gang path, not a replacement for it.
+- **`7c80a3e`** — split `augment-loop.ts` (500.10GB reported / ~31GB real) and `faction-work-loop.ts` (386.10GB / ~21GB real) into 3.60GB orchestrators + transient workers, matching `gang-manager.ts`. First fixed `ram-costs.json`'s stale 16x singularity-cost tier (permanently wrong post-SF4.3) that was making these numbers look inflated. On request, also extracted the `readJson`/`isStale`/`dispatchOnce` duplication (5 orchestrators) into `src/lib/manager-dispatch.ts`, and centralized `NEUROFLUX_NAME`/`FactionName`. Five rounds of `code-review high` caught and fixed real regressions — most seriously, the new controller.ts kill-chase used `ns.kill(filename, host)` (zero-arg match only) against workers dispatched with JSON args, silently never killing them; replaced with PID-based `killAllInstances()`.
+- **`763d8b0`** — built `bladeburner-stat-loop.ts` (gym-trains combat stats to 100) + `bladeburner-manager.ts` orchestrator + 4 transient workers, wired into `controller.ts`'s crime/faction/company work-slot rotation as a 4th candidate. Research's ~2.9GB single-script estimate didn't hold for this game version (`ns-cost-lookup` confirmed ~4GB per `ns.bladeburner.*` call, ~59-63GB for a lean single script) — built the orchestrator/worker split from the start. Bonus: fixed a real crash in `ns-cost-lookup.mjs` (a stray blank line in `gymWorkout`'s JSDoc broke its RAM-cost-line walk).
+- **No code, informational** — clarified for the user that a gang's 0% "Territory Clash Chance" (engagement off) and its real 97.479% "Clash Win Chance" are different stats; the 99.5% engage-threshold automation is working as designed.
+
+### Decisions
+- Bladeburner is a 4th work-slot rotation candidate, not a gang-path replacement — gang income runs independently of the player's own action slot.
+- Declined reconstituting the old monoliths' 5-minute Singularity-error backoff in the new workers (user's call, left at 30s) — it was insurance for a failure mode never observed live.
+- Deferred a pre-existing (not introduced by this work) cross-faction candidate/donate-target overlap bug in `augment-loop.ts`'s gating, confirmed by `code-review` to predate the split.
+
+### Issues / surprises
+- Self-caught RAM regression mid-task: importing `NEUROFLUX_NAME` from a file that also exported `gatherFactionAugGaps` re-inflated both orchestrators from 3.60GB to 12.10GB — this repo's cost model charges a whole imported file's `ns.*` surface, not just the referenced symbol. Caught immediately via `ram-audit`, fixed with a separate zero-`ns`-import constants file.
+
+### Next session
+- Behavioral live confirmation of both the augment/faction split (augmentations bought/donated/installed, faction targets switching) and the bladeburner hand-off (stat-loop → manager) — both blocked on game-state (a gang existing; combat stats reaching 100) that this fresh BN6.1 save doesn't have yet.
+- Fix the still-open `wantRespect` member-cap null bug once the gang hits cap again.
+- Per `[[bitburner_bitnode_route]]`: BN6+BN7 is the current step; BN10 next after that.
+
+**Commits**: `2956dd8..7c80a3e` (2 commits this session: `763d8b0`, `7c80a3e`)
+
+---
 
 **Focus**: Run all six `/improve-system` sub-skills in one pass — skill-upgrade, skill-suggestion, agent-suggestion, claude-rules, skill-audit, fewer-permission-prompts — auto-applying low-risk additive fixes and confirming structural ones.
 
