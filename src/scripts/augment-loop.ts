@@ -1,126 +1,123 @@
 import type { NS } from "../NetscriptDefinitions";
+import type { AugmentActCandidate, AugmentActDonateTarget, AugmentActPayload, AugmentFactionSnapshot, AugmentStateReport } from "../lib/types";
+import { dispatchOnce, isStale, readJson } from "../lib/manager-dispatch";
+import { NEUROFLUX_NAME } from "../lib/singularity-constants";
 
-// FactionName isn't exported from NetscriptDefinitions - derive it from getPlayer()'s return
-// type, same approach faction-work-loop.ts/company-work-loop.ts use for FactionName/CompanyName.
-type FactionName = ReturnType<NS["getPlayer"]>["factions"][number];
+// Split into a cheap orchestrator + transient augment-agent-*.ts workers (2026-08-30, same
+// RAM-split shape as gang-manager.ts/corp-manager.ts/bladeburner-manager.ts - see
+// [[bitburner_bn4_singularity]]): the previous single-file augment-loop.ts referenced 8 distinct
+// ns.singularity.* functions permanently (~31GB native once SF4.3's multiplier is accounted for -
+// see [[bitburner_singularity_ram_tier_stale]]). augment-agent-status.ts (transient) bears almost
+// the whole read cost; this file makes every decision as pure computation over that cached report
+// (see the compute* functions below - none of them touch `ns.singularity.*`) and
+// dispatches augment-agent-act.ts (transient) for the handful of live mutating calls each decision
+// tick actually needs. This file's own resident cost is now just ns.exec/ns.read/ns.fileExists/
+// ns.rm/ns.print/ns.sleep plus the free ns.gang.inGang().
+const AUGMENT_AGENT_STATUS_SCRIPT = "scripts/augment-agent-status.js";
+const AUGMENT_AGENT_ACT_SCRIPT = "scripts/augment-agent-act.js";
+
+// Sole writer is augment-agent-status.ts - kept in sync by hand, matching gang-manager.ts's
+// GANG_STATE_PATH convention (not centralized).
+const AUGMENT_STATE_PATH = "/data/augment-state.json";
 
 const AUGMENT_LOOP_INTERVAL_MS = 30000;
-const SINGULARITY_UNAVAILABLE_RETRY_MS = 300000;
+// How long a cached augment-state.json report is trusted before re-dispatching
+// augment-agent-status.ts - matches gang-manager.ts's STATUS_REFRESH_MS reasoning (same value as
+// its own loop interval). Note this does NOT preserve the original monolith's true per-30s decide
+// cadence: any tick that dispatches augment-agent-act.ts deletes the report immediately after (see
+// main()'s own comment on that ns.rm), so the following tick only refreshes status and makes no
+// decision - real-world decide+act cadence after an action is up to ~2x this interval, not this
+// interval itself. Matches gang-manager.ts's/bladeburner-manager.ts's identical
+// refresh-equals-interval + invalidate-after-acting shape, already running this way without issue.
+const STATUS_REFRESH_MS = 30000;
 // Only start spending on augmentations once the gang exists (user-directed priority: crime-loop
 // grinds karma to gang creation first; installing an augmentation resets hacking/combat stats to
 // 1, which would undo Homicide-chance progress mid-grind if this ran any earlier).
 const IDLE_BEFORE_GANG_MS = 60000;
 // Leave a slice of cash unspent, same pattern as gang-manager.ts's RESERVE_FRACTION.
 const RESERVE_FRACTION = 0.1;
-const NEUROFLUX_NAME = "NeuroFlux Governor";
-// Safety valve on the leftover-budget NeuroFlux spend loop below - its price climbs every
-// purchase, so this is just a bound on iteration count, not expected to ever bind in practice.
-const NEUROFLUX_MAX_PURCHASES_PER_TICK = 100;
-// installAugmentations' cbScript re-enters the existing chain-launch bootstrap after the reset
-// (scan-root.js -> rescan-loop.js -> controller.js -> everything else, including
-// program-buy-loop.js re-buying whatever home .exe programs the reset wiped) - this is the
-// "re-bootstrap handling" singularity-roadmap.md flagged as the blocker on this automation.
-const SCAN_ROOT_SCRIPT = "scripts/scan-root.js";
 
-interface Candidate {
-	faction: FactionName;
-	name: string;
+interface CandidateComputation {
+	candidates: AugmentActCandidate[];
+	gatedCount: number;
+	donateTarget: AugmentActDonateTarget | null;
+	nfgDonateTarget: AugmentActDonateTarget | null;
 }
 
-// Highest base price first: the game's per-purchase price multiplier raises the cost of every
-// augmentation not yet bought this session, so front-loading the priciest one lets that
-// multiplier apply fewer times to it - minimizes total spend across the whole batch.
-function collectCandidates(ns: NS, factions: FactionName[], owned: Set<string>): Candidate[] {
-	const candidates: Candidate[] = [];
+// Single pass over every faction's every augmentation - collecting buyable candidates AND tracking
+// rep-gated gaps used to be two separate traversals with slightly different but overlapping filter
+// conditions (owned/NEUROFLUX_NAME/gang-faction checks); merged into one so there's exactly one
+// place that encodes "what counts as buyable/gated/gang-excluded", not two that have to be kept in
+// sync by hand - see [[bitburner_augment_loop_nfg_gate]] for the multi-round history of bugs from
+// exactly that kind of drift. Candidates come back sorted highest-price-first: the game's
+// per-purchase price multiplier raises the cost of every augmentation not yet bought this session,
+// so front-loading the priciest one lets that multiplier apply fewer times to it - minimizes total
+// spend across the whole batch. Prices come from the cached report - already stale by the time a
+// purchase lands, see AugmentAugSnapshot.price's own comment; that's fine here, only sort order
+// depends on it.
+function computeCandidatesAndGating(factions: AugmentFactionSnapshot[], owned: Set<string>, gangFaction: string | null): CandidateComputation {
+	const candidates: AugmentActCandidate[] = [];
+	const priceByName = new Map<string, number>();
 	const seen = new Set<string>();
+	let gatedCount = 0;
+	let donateTarget: AugmentActDonateTarget | null = null;
+	let nfgDonateTarget: AugmentActDonateTarget | null = null;
 
-	for (const faction of factions) {
-		const rep = ns.singularity.getFactionRep(faction);
-		for (const augName of ns.singularity.getAugmentationsFromFaction(faction)) {
-			if (augName === NEUROFLUX_NAME || owned.has(augName) || seen.has(augName)) continue;
-			if (rep < ns.singularity.getAugmentationRepReq(augName)) continue;
-			candidates.push({ faction, name: augName });
-			seen.add(augName);
+	for (const f of factions) {
+		// Can't donate to your own gang's faction (game restriction), and a gang aug's rep gate can
+		// never close via this automation either way (rep only grows via gang activity) - excluded
+		// from gating/donation tracking below, but NOT from `candidates`: a gang faction's
+		// augmentation is still directly buyable once naturally unlocked by rep.
+		const isGangFaction = f.faction === gangFaction;
+
+		for (const aug of f.augmentations) {
+			priceByName.set(aug.name, aug.price);
+
+			if (aug.name === NEUROFLUX_NAME) {
+				if (!isGangFaction) {
+					const gap = aug.repReq - f.rep;
+					if (gap > 0 && (nfgDonateTarget === null || gap < nfgDonateTarget.gap)) {
+						nfgDonateTarget = { faction: f.faction, name: aug.name, gap };
+					}
+				}
+				continue;
+			}
+
+			if (owned.has(aug.name)) continue;
+
+			if (f.rep >= aug.repReq) {
+				if (!seen.has(aug.name)) {
+					candidates.push({ faction: f.faction, name: aug.name });
+					seen.add(aug.name);
+				}
+				continue;
+			}
+
+			if (isGangFaction) continue;
+			gatedCount++;
+			const gap = aug.repReq - f.rep;
+			if (donateTarget === null || gap < donateTarget.gap) donateTarget = { faction: f.faction, name: aug.name, gap };
 		}
 	}
 
-	return candidates.sort((a, b) => ns.singularity.getAugmentationPrice(b.name) - ns.singularity.getAugmentationPrice(a.name));
+	candidates.sort((a, b) => {
+		const priceA = priceByName.get(a.name);
+		const priceB = priceByName.get(b.name);
+		return (priceB === undefined ? 0 : priceB) - (priceA === undefined ? 0 : priceA);
+	});
+
+	return { candidates, gatedCount, donateTarget, nfgDonateTarget };
 }
 
-function buyCandidates(ns: NS, candidates: Candidate[], budget: number): { spent: number; purchasedAny: boolean } {
-	let spent = 0;
-	let purchasedAny = false;
-
-	for (const candidate of candidates) {
-		// Re-check live price - an earlier purchase this same pass raises everyone's cost, so the
-		// price used to sort candidates above can already be stale by the time this one is tried.
-		const price = ns.singularity.getAugmentationPrice(candidate.name);
-		if (price > budget - spent) continue;
-		if (ns.singularity.purchaseAugmentation(candidate.faction, candidate.name)) {
-			spent += price;
-			purchasedAny = true;
-			ns.print(`augment-loop: purchased ${candidate.name} from ${candidate.faction} ($${Math.round(price).toLocaleString()})`);
-		}
+// The one faction augment-agent-act.ts should spend leftover budget on NeuroFlux Governor
+// through, if any - mirrors the original augment-loop.ts's buyNeuroFlux() faction search exactly,
+// just over the cached report instead of a live call.
+function findNfgFaction(factions: AugmentFactionSnapshot[]): string | null {
+	for (const f of factions) {
+		const nfg = f.augmentations.find((a) => a.name === NEUROFLUX_NAME);
+		if (nfg !== undefined && f.rep >= nfg.repReq) return f.faction;
 	}
-
-	return { spent, purchasedAny };
-}
-
-// Rep-per-dollar formula from bitburner-src's Faction/formulas/donation.ts: repGain = (amount /
-// DonateMoneyToRepDivisor) * player.mults.faction_rep * currentNodeMults.FactionWorkRepGain.
-// FactionWorkRepGain (only reachable via ns.getBitNodeMultipliers(), SF5-gated) is dropped/assumed
-// 1 here - same tradeoff hacknet-manager.ts's MONEY_GAIN_PER_LEVEL makes for its own
-// Formulas-derived constant: this only sizes a donation, and main() recomputes the rep gap fresh
-// every tick, so an imprecise multiplier just costs an extra tick or a slightly oversized
-// donation, never an incorrect one.
-const DONATE_MONEY_TO_REP_DIVISOR = 1e6;
-
-function donationCostForRep(repNeeded: number, factionRepMult: number): number {
-	return (repNeeded * DONATE_MONEY_TO_REP_DIVISOR) / factionRepMult;
-}
-
-// Donates just enough to close the smallest rep gate blocking a purchasable augmentation - not the
-// whole remaining budget, so leftover still reaches buyNeuroFlux this same tick. Donation is
-// favor-gated (150 base favor per FavorToDonateToFaction, see donateToFaction's doc) with no cheap
-// way to read the live per-BitNode threshold (same getBitNodeMultipliers gate as above) - rather
-// than replicate it, this just attempts the donation and reads the boolean result. False means
-// either favor isn't there yet or (per the API) the target is the player's own gang faction; main()
-// already excludes the gang faction from candidacy, so a false here in practice just means "wait
-// for more favor" - and a rejected donateToFaction call doesn't spend any money either way.
-function buyDonation(ns: NS, target: Candidate & { gap: number }, factionRepMult: number, budget: number): { spent: number; donatedAny: boolean } {
-	const amount = Math.min(donationCostForRep(target.gap, factionRepMult), budget);
-	if (amount <= 0) return { spent: 0, donatedAny: false };
-
-	if (!ns.singularity.donateToFaction(target.faction, amount)) return { spent: 0, donatedAny: false };
-
-	ns.print(
-		`augment-loop: donated $${Math.round(amount).toLocaleString()} to ${target.faction} (toward ${target.name}, needed ~${Math.round(target.gap).toLocaleString()} rep)`,
-	);
-	return { spent: amount, donatedAny: true };
-}
-
-// NeuroFlux Governor is repeatable with an infinitely-scaling price - dumps whatever budget it's
-// given into repeat purchases. Callers decide *whether* to call this at all (see canBuyNfg in
-// main): NFG is cheap and always affordable early, so calling it unconditionally would drain the
-// budget every tick before it could ever accumulate enough for a pricier real augmentation.
-function buyNeuroFlux(ns: NS, factions: FactionName[], remainingBudget: number): { spent: number; purchasedAny: boolean } {
-	const faction = factions.find(
-		(f) => ns.singularity.getAugmentationsFromFaction(f).includes(NEUROFLUX_NAME) && ns.singularity.getFactionRep(f) >= ns.singularity.getAugmentationRepReq(NEUROFLUX_NAME),
-	);
-	if (faction === undefined) return { spent: 0, purchasedAny: false };
-
-	let spent = 0;
-	let purchasedAny = false;
-	for (let i = 0; i < NEUROFLUX_MAX_PURCHASES_PER_TICK; i++) {
-		const price = ns.singularity.getAugmentationPrice(NEUROFLUX_NAME);
-		if (price > remainingBudget - spent) break;
-		if (!ns.singularity.purchaseAugmentation(faction, NEUROFLUX_NAME)) break;
-		spent += price;
-		purchasedAny = true;
-		ns.print(`augment-loop: purchased ${NEUROFLUX_NAME} from ${faction} ($${Math.round(price).toLocaleString()})`);
-	}
-
-	return { spent, purchasedAny };
+	return null;
 }
 
 export async function main(ns: NS): Promise<void> {
@@ -133,119 +130,55 @@ export async function main(ns: NS): Promise<void> {
 			continue;
 		}
 
-		try {
-			const installedList = ns.singularity.getOwnedAugmentations(false);
-			const ownedList = ns.singularity.getOwnedAugmentations(true);
-			const installedBefore = new Set(installedList);
-			const owned = new Set(ownedList);
-			// A non-NFG augmentation already sitting in the queue (purchased an earlier tick, not
-			// yet installed) - see canBuyNfg below.
-			const queuedHasReal = ownedList.some((name) => name !== NEUROFLUX_NAME && !installedBefore.has(name));
-
-			const player = ns.getPlayer();
-			const factions = player.factions;
-			const budget = player.money * (1 - RESERVE_FRACTION);
-
-			const candidates = collectCandidates(ns, factions, owned);
-
-			// Can't donate to your own gang's faction (game restriction, see buyDonation), and
-			// can't work for it either - gang factions offer none of the FactionWorkType work
-			// types (their page is Territory/Augmentations only), so workForFaction always fails
-			// for it too. Excluded up front, before gatedCount, not just from donateTarget - a
-			// gang aug's rep gate is not something this automation can ever close (gang rep only
-			// grows via gang activity), so it must not count toward "is there still a real
-			// augmentation this automation could make progress on" either. Previously the gang
-			// exclusion only guarded donateTarget selection while still incrementing gatedCount,
-			// so any rep-gated gang augmentation permanently held canBuyNfg false below - stranding
-			// every tick of rep faction-work-loop.ts earns toward NeuroFlux Governor at whichever
-			// non-gang faction has the closest gap, since it could never actually get spent while
-			// gatedCount stayed stuck above 0 (2026-08-15 fix, reported live: character grinding
-			// Sector-12 rep for NFG despite Sector-12 showing "No Augmentations left").
-			const gangFaction = ns.gang.getGangInformation().faction;
-
-			// A rep-gated real augmentation is NOT in candidates (collectCandidates filters it out)
-			// but still counts as "something to save toward" - without this, canBuyNfg below would
-			// see candidates.length === 0 and mistake "not rep-unlocked yet" for "nothing real left,
-			// ever", draining the budget into NeuroFlux while rep is still catching up (this is the
-			// second half of the NFG-only-install bug c09d707 only partly fixed: that fix closed the
-			// money-starvation path but left this rep-starvation path open). donateTarget tracks the
-			// single smallest gap across every gated augmentation - the fastest gap to close via
-			// donation, same "closest gap" priority faction-work-loop.ts's orderFactionsByAugmentGap
-			// uses for work targeting.
-			let gatedCount = 0;
-			let donateTarget: (Candidate & { gap: number }) | null = null;
-			// NeuroFlux Governor's own rep gap, tracked separately from gatedCount/donateTarget above -
-			// see the nothingRealLeft comment below for why it can't just be lumped in with those.
-			let nfgDonateTarget: (Candidate & { gap: number }) | null = null;
-			for (const faction of factions) {
-				if (faction === gangFaction) continue;
-				const rep = ns.singularity.getFactionRep(faction);
-				for (const augName of ns.singularity.getAugmentationsFromFaction(faction)) {
-					if (augName !== NEUROFLUX_NAME && owned.has(augName)) continue;
-					const gap = ns.singularity.getAugmentationRepReq(augName) - rep;
-					if (gap <= 0) continue;
-					if (augName === NEUROFLUX_NAME) {
-						if (nfgDonateTarget === null || gap < nfgDonateTarget.gap) nfgDonateTarget = { faction, name: augName, gap };
-						continue;
-					}
-					gatedCount++;
-					if (donateTarget === null || gap < donateTarget.gap) donateTarget = { faction, name: augName, gap };
-				}
-			}
-
-			// True once there's no real augmentation left to buy (candidates) or save rep toward
-			// (gatedCount) - the same "nothing real left" condition canBuyNfg below already uses to
-			// decide it's safe to spend money on NeuroFlux instead of holding budget for a pricier
-			// real augment. Reused here for the *donation* half of the pipeline too (2026-08-18 fix):
-			// NeuroFlux Governor used to be hard-excluded from ever becoming a donateTarget (see the
-			// `augName === NEUROFLUX_NAME` skip this replaced), so once nothing real remained, rep
-			// toward NFG's ever-scaling requirement could only close via faction-work-loop.js's ~30
-			// rep/sec work grind - the money-donation shortcut (repGain = amount / 1e6 * faction_rep
-			// mult, effectively instant for a multi-billion-dollar budget) sat completely unusable no
-			// matter how large the budget got. Confirmed live: budget climbed from $901k to $1.04T
-			// over 27 ticks with candidates=0 gated=0 the entire time, augment-loop never once
-			// donating - see bitburner_augment_loop_nfg_gate memory. Guarded behind nothingRealLeft
-			// (not spent unconditionally) so a real augment's donation still gets first dibs on the
-			// budget whenever one is actually gated.
-			// Explicit null check instead of `??` - see orderFactionsByAugmentGap's comment in
-			// faction-work-loop.ts for the confirmed finding that the game's own static RAM analyzer
-			// sometimes attributes a phantom RAM charge to scripts using the nullish-coalescing operator.
-			const nothingRealLeft = candidates.length === 0 && gatedCount === 0;
-			const effectiveDonateTarget = donateTarget !== null ? donateTarget : nothingRealLeft ? nfgDonateTarget : null;
-
-			const real = buyCandidates(ns, candidates, budget);
-			const donation =
-				effectiveDonateTarget !== null ? buyDonation(ns, effectiveDonateTarget, player.mults.faction_rep, budget - real.spent) : { spent: 0, donatedAny: false };
-
-			// Only spend on NeuroFlux once a real augmentation is already queued (this tick's
-			// purchase above, or an earlier tick's) or there's nothing real left to save toward at
-			// all - no candidates AND nothing rep-gated either - otherwise NFG's cheap,
-			// always-affordable price drains the budget every tick before it can ever reach a
-			// pricier real augment, and installs end up NFG-only (the bug this guards against).
-			const canBuyNfg = real.purchasedAny || queuedHasReal || nothingRealLeft;
-			const nfg = canBuyNfg ? buyNeuroFlux(ns, factions, budget - real.spent - donation.spent) : { spent: 0, purchasedAny: false };
-			// donation.donatedAny counts too, even though it isn't a purchase: buyCandidates already
-			// ran above this tick, so a donation that just closed an augmentation's rep gate hasn't
-			// been spent on that augmentation yet - it'll be bought on the next tick's buyCandidates
-			// pass. If nothing else were queued this tick, that'd fall through to installAugmentations
-			// below and reset reputation to 0 before ever buying the augmentation the donation just
-			// unlocked, wasting the whole donation.
-			const purchasedAny = real.purchasedAny || nfg.purchasedAny || donation.donatedAny;
-
-			ns.print(
-				`augment-loop: candidates=${candidates.length} gated=${gatedCount} donated=$${Math.round(donation.spent).toLocaleString()} queuedHasReal=${queuedHasReal} canBuyNfg=${canBuyNfg} budget=$${Math.round(budget).toLocaleString()}`,
-			);
-
-			// Nothing more purchasable this tick and something's queued - cash in the batch.
-			const queuedCount = ns.singularity.getOwnedAugmentations(true).length - ns.singularity.getOwnedAugmentations(false).length;
-			if (!purchasedAny && queuedCount > 0) {
-				ns.print(`augment-loop: installing ${queuedCount} queued augmentation(s)`);
-				ns.singularity.installAugmentations(SCAN_ROOT_SCRIPT);
-			}
-		} catch (error) {
-			ns.print(`augment-loop: singularity unavailable (${String(error)}) - backing off`);
-			await ns.sleep(SINGULARITY_UNAVAILABLE_RETRY_MS);
+		const report = readJson<AugmentStateReport>(ns, AUGMENT_STATE_PATH);
+		if (!report || isStale(report.writtenAt, STATUS_REFRESH_MS)) {
+			dispatchOnce(ns, "augment-loop", AUGMENT_AGENT_STATUS_SCRIPT);
+			await ns.sleep(AUGMENT_LOOP_INTERVAL_MS);
 			continue;
+		}
+
+		const installedBefore = new Set(report.installedList);
+		const owned = new Set(report.ownedList);
+		// A non-NFG augmentation already sitting in the queue (purchased an earlier tick, not yet
+		// installed) - see augment-agent-act.ts's canBuyNfg gate.
+		const queuedHasReal = report.ownedList.some((name) => name !== NEUROFLUX_NAME && !installedBefore.has(name));
+		const queuedCount = report.ownedList.length - report.installedList.length;
+
+		const { candidates, gatedCount, donateTarget, nfgDonateTarget } = computeCandidatesAndGating(report.factions, owned, report.gangFaction);
+		// True once there's no real augmentation left to buy (candidates) or save rep toward.
+		// Derived from donateTarget rather than gatedCount - computeCandidatesAndGating only ever
+		// increments gatedCount in the same branch that sets donateTarget, so the two are always
+		// equal to null/0 together; deriving from donateTarget directly means this condition can
+		// never drift out of sync with the very value it's actually gating (effectiveDonateTarget's
+		// fallback below). gatedCount is kept only for the diagnostic print line - see the original
+		// augment-loop.ts history for the multi-round NFG-starvation bugs this condition fixed.
+		const nothingRealLeft = candidates.length === 0 && donateTarget === null;
+		const effectiveDonateTarget = donateTarget !== null ? donateTarget : nothingRealLeft ? nfgDonateTarget : null;
+		const nfgFaction = findNfgFaction(report.factions);
+
+		const budget = report.playerMoney * (1 - RESERVE_FRACTION);
+
+		ns.print(
+			`augment-loop: candidates=${candidates.length} gated=${gatedCount} queuedHasReal=${queuedHasReal} nothingRealLeft=${nothingRealLeft} budget=$${Math.round(budget).toLocaleString()}`,
+		);
+
+		// queuedHasReal isn't checked here on its own - it always implies queuedCount > 0 (already
+		// covered below), since a "real" queued augmentation is by definition owned-but-uninstalled.
+		const hasSomethingToDo = candidates.length > 0 || effectiveDonateTarget !== null || queuedCount > 0 || (nfgFaction !== null && nothingRealLeft);
+		if (hasSomethingToDo) {
+			const payload: AugmentActPayload = {
+				candidates,
+				budget,
+				donateTarget: effectiveDonateTarget,
+				factionRepMult: report.factionRepMult,
+				nfgFaction,
+				queuedHasReal,
+				nothingRealLeft,
+			};
+			// Force a fresh status snapshot before deciding again, rather than trusting this report
+			// until its own STATUS_REFRESH_MS timer expires - same re-verify-before-repeat protection
+			// gang-manager.ts/bladeburner-manager.ts give their own decision ticks.
+			if (dispatchOnce(ns, "augment-loop", AUGMENT_AGENT_ACT_SCRIPT, JSON.stringify(payload))) ns.rm(AUGMENT_STATE_PATH, "home");
 		}
 
 		await ns.sleep(AUGMENT_LOOP_INTERVAL_MS);

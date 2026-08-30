@@ -1,72 +1,67 @@
 import type { NS } from "../NetscriptDefinitions";
+import type { FactionCandidateSnapshot, FactionWorkPayload, FactionWorkStateReport } from "../lib/types";
+import { dispatchOnce, isStale, readJson } from "../lib/manager-dispatch";
+import { NEUROFLUX_NAME } from "../lib/singularity-constants";
 
-// FactionName isn't exported from NetscriptDefinitions.d.ts, so derive its shape from
-// getPlayer()'s return type instead - same approach battlestation.ts uses for MoneySource.
-type FactionName = ReturnType<NS["getPlayer"]>["factions"][number];
+// Split into a cheap orchestrator + transient faction-agent-*.ts workers (2026-08-30, same
+// RAM-split shape as gang-manager.ts/corp-manager.ts/bladeburner-manager.ts/augment-loop.ts - see
+// [[bitburner_bn4_singularity]]): the previous single-file faction-work-loop.ts referenced 8
+// distinct ns.singularity.* functions permanently (~21GB native once SF4.3's multiplier is
+// accounted for - see [[bitburner_singularity_ram_tier_stale]]). faction-agent-status.ts
+// (transient) bears almost the whole read cost (plus auto-joining pending invitations, cheap and
+// idempotent so it's folded into the same status pass rather than a third worker); this file makes
+// every decision as pure computation over that cached report (orderFactionsByAugmentGap below never
+// touches `ns.singularity.*`) and dispatches faction-agent-work.ts (transient) for the one live
+// workForFaction/stopAction decision each tick actually needs. This file's own resident cost is now
+// just ns.exec/ns.read/ns.fileExists/ns.rm/ns.print/ns.sleep.
+const FACTION_AGENT_STATUS_SCRIPT = "scripts/faction-agent-status.js";
+const FACTION_AGENT_WORK_SCRIPT = "scripts/faction-agent-work.js";
+
+// Sole writer is faction-agent-status.ts - kept in sync by hand, matching gang-manager.ts's
+// GANG_STATE_PATH convention (not centralized).
+const FACTION_WORK_STATE_PATH = "/data/faction-work-state.json";
 
 const FACTION_WORK_LOOP_INTERVAL_MS = 30000;
-// The 2026-07-31 finding that upgradeHomeRam could error demanding SF4 even inside BN4 (see
-// bitburner_singularity_locked memory) does NOT reproduce for the calls here either - confirmed
-// live 2026-08-09: this script joined/started working for a faction inside BN4 with no errors.
-// Kept as general defensive insurance regardless. Back off far longer than the normal loop
-// interval so a recurring failure doesn't spam retries.
-const SINGULARITY_UNAVAILABLE_RETRY_MS = 300000;
-// "Hacking Contracts" - per jobs.md's researched faction-work comparison: 2x Field Work's
-// hacking XP, 4x Security Work's, and the only one of the three whose reputation formula is
-// dominated by hacking skill rather than combat stats.
-const WORK_TYPE = "hacking";
-// Tie-break only: used when two+ joined factions are equally promising by augment-rep-gap - not
-// a fixed default target anymore, see orderFactionsByAugmentGap.
-const PREFERRED_FIRST_FACTION: FactionName = "CyberSec";
-const NEUROFLUX_NAME = "NeuroFlux Governor";
+// How long a cached faction-work-state.json report is trusted before re-dispatching
+// faction-agent-status.ts - set equal to the loop interval, matching augment-loop.ts's identical
+// shape (see that file's own comment: a tick that dispatches faction-agent-work.ts deletes the
+// report right after, so the following tick only refreshes status - real decide cadence after a
+// dispatch is up to ~2x this interval, not this interval itself).
+const STATUS_REFRESH_MS = 30000;
+// Tie-break only: used when two+ joined factions are equally promising by augment-rep-gap - not a
+// fixed default target, see orderFactionsByAugmentGap.
+const PREFERRED_FIRST_FACTION = "CyberSec";
 
-let targetFaction: FactionName | null = null;
+// Top-ranked candidate as of the last tick this orchestrator logged a change - null until the
+// first decision is made. Restores the original monolithic faction-work-loop.ts's "switching
+// target X -> Y" signal (lost when the actual workForFaction call moved into the transient,
+// state-free faction-agent-work.ts): this tracks what the orchestrator is now prioritizing, not
+// confirmed workForFaction success (that's faction-agent-work.ts's own per-dispatch "target="
+// print) - close enough to have been load-bearing for diagnosing this repo's repeated NFG/
+// gap-starvation bug class, see [[bitburner_augment_loop_nfg_gate]].
+let lastLoggedTarget: string | null = null;
 
 // Ranks joined factions by how close they are to unlocking their next real augmentation -
 // ascending reputation gap first. Factions with nothing left to grind rep for (every augment
-// either owned or already at sufficient rep, NeuroFlux Governor included) are dropped entirely
-// rather than ranked with an Infinity gap: working one of them still earns reputation, but with
-// no purchasable payoff, and previously that meant it stayed the target forever (see main()'s
-// stopAction call, the other half of this fix - 2026-08-13, user-directed: "only one faction
-// unlocked, no augments to obtain from it, time would be better spent earning money" - without
-// this, company-work-loop.js's money-earning never got a turn). Also fixes the original bug:
-// sticking with one faction forever meant every other joined faction's augments stayed
-// permanently rep-gated even while reputation could've been earned for them instead (see
-// augment-loop.ts's canBuyNfg diagnostic, which is what surfaced this - gated=60 and unmoving
-// for 30+ ticks because only one faction was ever being worked).
-function orderFactionsByAugmentGap(ns: NS, factions: FactionName[], owned: Set<string>): FactionName[] {
-	const gapByFaction = new Map<FactionName, number>();
+// either owned or already at sufficient rep, NeuroFlux Governor included) are dropped entirely -
+// see the original faction-work-loop.ts history for the multi-round bug this exact exclusion
+// fixed (a faction with only NFG left never dropping out of `ordered`, permanently starving
+// company-work-loop.js of the work slot).
+function orderFactionsByAugmentGap(factions: FactionCandidateSnapshot[], owned: Set<string>): string[] {
+	const gapByFaction = new Map<string, number>();
 
-	for (const faction of factions) {
-		const rep = ns.singularity.getFactionRep(faction);
+	for (const f of factions) {
 		let minGap = Infinity;
-		for (const augName of ns.singularity.getAugmentationsFromFaction(faction)) {
-			// NeuroFlux Governor excluded outright (2026-08-18 fix, reverting an earlier attempt
-			// that deliberately kept tracking its gap here "since it's still worth grinding for") -
-			// unlike a real augmentation, NFG's rep requirement renews every level, so a faction
-			// with zero real augmentations left (e.g. Sector-12 showing "No Augmentations left" in
-			// the UI) still produced a finite minGap from NFG alone and never dropped out of
-			// `ordered`. That pinned this faction as newTarget forever: workForFaction kept
-			// succeeding, currentWork.type stayed "FACTION" permanently, and controller.ts's
-			// decideActiveWorkScript grace-period fallback (which only reroutes to
-			// company-work-loop.js once faction work actually stops) never got a chance to fire -
-			// starving money-earning entirely for a rep-grind confirmed live to have zero payoff
-			// (that faction's favor is permanently capped below the ~150 donateToFaction threshold
-			// once it has no augmentations left to install, so augment-loop.ts's donation shortcut
-			// for NFG is a dead end there too). Matches collectCandidates' own NFG exclusion in
-			// augment-loop.ts - NFG progress is meant to come from augment-loop.ts's donation/
-			// leftover-budget spend once nothingRealLeft, not from actively working a dead faction
-			// for it. See [[bitburner_augment_loop_nfg_gate]], which recorded this exact symptom
-			// once already (2026-08-15) but only patched augment-loop.ts's spending gate, not this
-			// file's work-target selection - it resurfaced identically for that reason.
-			if (augName === NEUROFLUX_NAME || owned.has(augName)) continue;
-			const gap = ns.singularity.getAugmentationRepReq(augName) - rep;
+		for (const aug of f.augmentations) {
+			if (aug.name === NEUROFLUX_NAME || owned.has(aug.name)) continue;
+			const gap = aug.repReq - f.rep;
 			if (gap > 0 && gap < minGap) minGap = gap;
 		}
-		gapByFaction.set(faction, minGap);
+		gapByFaction.set(f.faction, minGap);
 	}
 
 	return factions
+		.map((f) => f.faction)
 		.filter((f) => {
 			const gap = gapByFaction.get(f);
 			return gap !== undefined && gap < Infinity;
@@ -74,9 +69,9 @@ function orderFactionsByAugmentGap(ns: NS, factions: FactionName[], owned: Set<s
 		.sort((a, b) => {
 			// Explicit undefined checks instead of `??` - this project's ram-audit skill has a
 			// confirmed finding that the game's own static RAM analyzer sometimes attributes an
-			// unrelated ~10GB phantom charge to scripts using the nullish-coalescing operator.
-			// Both a and b already passed the finite-gap filter above, so these fallbacks are
-			// purely defensive and never actually hit.
+			// unrelated ~10GB phantom charge to scripts using the nullish-coalescing operator. Both a
+			// and b already passed the finite-gap filter above, so these fallbacks are purely
+			// defensive and never actually hit.
 			const gaRaw = gapByFaction.get(a);
 			const gbRaw = gapByFaction.get(b);
 			const ga = gaRaw === undefined ? Infinity : gaRaw;
@@ -87,75 +82,40 @@ function orderFactionsByAugmentGap(ns: NS, factions: FactionName[], owned: Set<s
 }
 
 export async function main(ns: NS): Promise<void> {
-	// orderFactionsByAugmentGap now calls getFactionRep/getAugmentationsFromFaction/
-	// getAugmentationRepReq once per augment per joined faction, every tick - without this,
-	// auto-logged ns.* call lines flood the tail buffer and evict real diagnostics.
 	ns.disableLog("ALL");
 	ns.print("faction-work-loop: starting");
 
 	while (true) {
-		let singularityUnavailable = false;
-		try {
-			for (const faction of ns.singularity.checkFactionInvitations()) {
-				if (ns.singularity.joinFaction(faction)) {
-					ns.print(`faction-work-loop: joined ${faction}`);
-				}
-			}
-
-			// controller.ts's coordinator guarantees crime-loop.js/company-work-loop.js are never
-			// resident at the same time as this script (kill-then-run, see controller.ts's
-			// decideActiveWorkScript) - no cross-script deference needed here, just the
-			// pre-existing same-target dedup below.
-			const currentWork = ns.singularity.getCurrentWork();
-			// "Bladeburners" (joined via ns.bladeburner.joinBladeburnerFaction() in
-			// bladeburner-agent-join.ts, not checkFactionInvitations()/joinFaction() above) lands in
-			// this same array once joined - no special-casing needed here, it's ranked by
-			// orderFactionsByAugmentGap and worked like any other faction below. If it turns out not
-			// to support the "hacking" WORK_TYPE, workForFaction just returns false and this loop
-			// moves on to the next candidate, same as any faction that doesn't offer it.
-			const joined = ns.getPlayer().factions;
-			const owned = new Set(ns.singularity.getOwnedAugmentations(true));
-
-			// Re-rank every tick instead of picking once and sticking forever - as reputation
-			// accrues from this loop's own work, the closest-gap faction changes, and this
-			// naturally rolls the loop on to the next one once the current target's gap closes to
-			// zero (i.e. its augmentation becomes buyable).
-			const ordered = orderFactionsByAugmentGap(ns, joined, owned);
-
-			let newTarget: FactionName | null = null;
-			for (const candidate of ordered) {
-				const alreadyWorkingHere =
-					currentWork !== null && currentWork.type === "FACTION" && currentWork.factionName === candidate;
-				if (alreadyWorkingHere || ns.singularity.workForFaction(candidate, WORK_TYPE, false)) {
-					newTarget = candidate;
-					break;
-				}
-			}
-
-			// Nothing worth targeting this tick (ordered came back empty because every joined
-			// faction's minGap is Infinity, or every workForFaction attempt above failed) but a
-			// previous tick's faction work may still be running - the game keeps an action going
-			// until something explicitly stops or replaces it, it doesn't expire on its own just
-			// because this loop stopped renewing it. Release it so ns.singularity.getCurrentWork()
-			// stops reporting type "FACTION", which is the signal controller.ts's
-			// decideActiveWorkScript already polls for (its existing FACTION_GRACE_MS fallback) to
-			// hand the work slot to company-work-loop.js (money) instead - without this, a faction
-			// with nothing left to buy would grind reputation forever with no purchasable payoff.
-			if (newTarget === null && currentWork !== null && currentWork.type === "FACTION") {
-				ns.singularity.stopAction();
-			}
-
-			if (newTarget !== targetFaction) {
-				const from = targetFaction === null ? "(none)" : targetFaction;
-				const to = newTarget === null ? "(none)" : newTarget;
-				ns.print(`faction-work-loop: switching target ${from} -> ${to}`);
-			}
-			targetFaction = newTarget;
-		} catch (error) {
-			ns.print(`faction-work-loop: singularity unavailable (${String(error)}) - backing off`);
-			singularityUnavailable = true;
+		const report = readJson<FactionWorkStateReport>(ns, FACTION_WORK_STATE_PATH);
+		if (!report || isStale(report.writtenAt, STATUS_REFRESH_MS)) {
+			dispatchOnce(ns, "faction-work-loop", FACTION_AGENT_STATUS_SCRIPT);
+			await ns.sleep(FACTION_WORK_LOOP_INTERVAL_MS);
+			continue;
 		}
 
-		await ns.sleep(singularityUnavailable ? SINGULARITY_UNAVAILABLE_RETRY_MS : FACTION_WORK_LOOP_INTERVAL_MS);
+		const owned = new Set(report.owned);
+		const ordered = orderFactionsByAugmentGap(report.factions, owned);
+		const alreadyWorkingFaction = report.currentWork !== null && report.currentWork.type === "FACTION" ? report.currentWork.factionName : null;
+
+		ns.print(`faction-work-loop: ordered=[${ordered.join(", ")}] alreadyWorking=${alreadyWorkingFaction === null ? "(none)" : alreadyWorkingFaction}`);
+
+		const topCandidate = ordered.length > 0 ? ordered[0] : null;
+		if (topCandidate !== lastLoggedTarget) {
+			ns.print(`faction-work-loop: switching target ${lastLoggedTarget === null ? "(none)" : lastLoggedTarget} -> ${topCandidate === null ? "(none)" : topCandidate}`);
+			lastLoggedTarget = topCandidate;
+		}
+
+		// Dispatch whenever there's a candidate to try OR a previous tick's work needs releasing
+		// (nothing left worth targeting but still marked FACTION) - matches the original monolithic
+		// script's unconditional per-tick workForFaction/stopAction pass.
+		if (ordered.length > 0 || alreadyWorkingFaction !== null) {
+			const payload: FactionWorkPayload = { ordered, alreadyWorkingFaction };
+			// Force a fresh status snapshot before deciding again, rather than trusting this report
+			// until its own STATUS_REFRESH_MS timer expires - same re-verify-before-repeat protection
+			// gang-manager.ts/bladeburner-manager.ts/augment-loop.ts give their own decision ticks.
+			if (dispatchOnce(ns, "faction-work-loop", FACTION_AGENT_WORK_SCRIPT, JSON.stringify(payload))) ns.rm(FACTION_WORK_STATE_PATH, "home");
+		}
+
+		await ns.sleep(FACTION_WORK_LOOP_INTERVAL_MS);
 	}
 }

@@ -1,5 +1,6 @@
 import type { NS } from "../NetscriptDefinitions";
 import type { BladeburnerActionCandidate, BladeburnerStateReport } from "../lib/types";
+import { dispatchOnce, isStale, readJson } from "../lib/manager-dispatch";
 
 // Orchestrator + transient bladeburner-agent-*.ts workers (2026-08-30), same shape as
 // gang-manager.ts/gang-agent-*.ts (see that file's own 2026-08-10 RAM-split comment) and
@@ -64,27 +65,6 @@ const SKILL_PRIORITY = [
 ];
 const TRAP_SKILLS = new Set(["Cloak", "Short-Circuit"]);
 const TRAP_SKILL_LEVEL_CAP = 25;
-
-function readReport(ns: NS): BladeburnerStateReport | undefined {
-	if (!ns.fileExists(BLADEBURNER_STATE_PATH, "home")) return undefined;
-	const raw = ns.read(BLADEBURNER_STATE_PATH);
-	if (!raw) return undefined;
-	return JSON.parse(raw) as BladeburnerStateReport;
-}
-
-function isStale(writtenAt: number, thresholdMs: number): boolean {
-	return Date.now() - writtenAt > thresholdMs;
-}
-
-function dispatchOnce(ns: NS, script: string, ...args: string[]): boolean {
-	const pid = ns.exec(script, "home", { threads: 1, preventDuplicates: true }, ...args);
-	if (pid === 0) {
-		ns.print(`bladeburner-manager: couldn't dispatch ${script} - check RAM, or a same-args instance is still running`);
-		return false;
-	}
-	ns.print(`bladeburner-manager: dispatched ${script} (pid ${pid})`);
-	return true;
-}
 
 // Picks the highest-priority skill that's both affordable and not past its trap-skill level cap.
 // Pure function over the cached report - no live ns.bladeburner.* reads.
@@ -158,7 +138,7 @@ export async function main(ns: NS): Promise<void> {
 			// Bladeburner Rank >= 25) and are usually reached at very different times -
 			// bladeburner-agent-join.ts attempts both unconditionally every tick until each
 			// succeeds, harmlessly no-op-ing on whichever isn't ready yet.
-			dispatchOnce(ns, BLADEBURNER_AGENT_JOIN_SCRIPT);
+			dispatchOnce(ns, "bladeburner-manager", BLADEBURNER_AGENT_JOIN_SCRIPT);
 			if (!inDivision) {
 				await ns.sleep(BOOTSTRAP_POLL_MS);
 				continue;
@@ -167,9 +147,9 @@ export async function main(ns: NS): Promise<void> {
 			// than blocking it on the (much later, Rank>=25-gated) faction join.
 		}
 
-		const report = readReport(ns);
+		const report = readJson<BladeburnerStateReport>(ns, BLADEBURNER_STATE_PATH);
 		if (!report || isStale(report.writtenAt, STATUS_REFRESH_MS)) {
-			dispatchOnce(ns, BLADEBURNER_AGENT_STATUS_SCRIPT);
+			dispatchOnce(ns, "bladeburner-manager", BLADEBURNER_AGENT_STATUS_SCRIPT);
 			await ns.sleep(BLADEBURNER_MANAGER_INTERVAL_MS);
 			continue;
 		}
@@ -178,13 +158,13 @@ export async function main(ns: NS): Promise<void> {
 
 		const skillToUpgrade = pickSkillToUpgrade(report);
 		if (skillToUpgrade) {
-			if (dispatchOnce(ns, BLADEBURNER_AGENT_UPGRADE_SKILL_SCRIPT, skillToUpgrade)) acted = true;
+			if (dispatchOnce(ns, "bladeburner-manager", BLADEBURNER_AGENT_UPGRADE_SKILL_SCRIPT, skillToUpgrade)) acted = true;
 		}
 
 		const desired = desiredAction(report);
 		const alreadyDoing = report.currentAction !== null && report.currentAction.type === desired.type && report.currentAction.name === desired.name;
 		if (!alreadyDoing) {
-			if (dispatchOnce(ns, BLADEBURNER_AGENT_START_ACTION_SCRIPT, desired.type, desired.name)) acted = true;
+			if (dispatchOnce(ns, "bladeburner-manager", BLADEBURNER_AGENT_START_ACTION_SCRIPT, desired.type, desired.name)) acted = true;
 		}
 
 		// Force a fresh status snapshot before deciding again, rather than trusting this report

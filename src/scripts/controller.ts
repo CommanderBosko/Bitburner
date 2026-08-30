@@ -48,19 +48,32 @@ const HOME_CORES_LOOP_SCRIPT = "scripts/home-cores-loop.js";
 const BACKDOOR_LOOP_SCRIPT = "scripts/backdoor-loop.js";
 // Work-loop group (crime-loop.js/faction-work-loop.js/company-work-loop.js) - NOT in
 // BN4_SINGULARITY_SCRIPTS below, unlike every other entry here. Live `mem` (2026-08-09) showed
-// all three's real costs (crime 11.60GB, faction 11.60GB, company 8.10GB) exactly match summing
+// crime/faction/company's real costs (11.60GB/11.60GB/8.10GB at the time) exactly match summing
 // each referenced ns.singularity.* function's documented cost - and Bitburner charges that sum
 // once per resident script regardless of how many of the referenced functions actually get
 // called at runtime. Since all three share the same Singularity "work slot" anyway
 // (commitCrime/workForFaction/workForCompany each cancel whichever of the others is in
-// progress), running only one at a time (8.10-11.60GB) costs meaningfully less than merging them
-// into one script that references all three's functions permanently (~27.6GB constant) -
-// confirmed live 2026-08-09 that running all three simultaneously starved crime-loop.js of the
-// RAM to even launch. decideActiveWorkScript below (used by both currentReserveGb and the
-// dedicated launch block in main()) is the single source of truth for which one SHOULD be
-// resident; everything else in this group derives from it.
+// progress), running only one at a time costs meaningfully less than merging them into one script
+// that references all three's functions permanently - confirmed live 2026-08-09 that running all
+// three simultaneously starved crime-loop.js of the RAM to even launch. faction-work-loop.js has
+// since been split into its own cheap orchestrator + transient faction-agent-*.js workers
+// (2026-08-30, ~21GB native down to ~3.60GB resident - see that script's own comment and
+// [[bitburner_singularity_ram_tier_stale]]); crime-loop.js/company-work-loop.js stay monolithic
+// (only 2-3 distinct calls each, so a split buys far less). decideActiveWorkScript below (used by
+// both currentReserveGb and the dedicated launch block in main()) is the single source of truth
+// for which one SHOULD be resident; everything else in this group derives from it.
 const COMPANY_WORK_LOOP_SCRIPT = "scripts/company-work-loop.js";
+// Split into a cheap orchestrator (~3.60GB, same as gang-manager.js) + transient
+// faction-agent-*.js workers (2026-08-30 - see
+// [[bitburner_bn4_singularity]]/[[bitburner_singularity_ram_tier_stale]]): the previous monolith
+// referenced 8 distinct ns.singularity.* functions permanently (~21GB native), the same shape
+// augment-loop.js was split for the same day. Unlike crime-loop.js/company-work-loop.js (still
+// monolithic, but only 2-3 calls each so a split buys much less - see that memory's per-script
+// cost table), this one had enough distinct calls to be worth it. See
+// factionAgentWorkerReserveGb below for its own worker-fleet reserve.
 const FACTION_WORK_LOOP_SCRIPT = "scripts/faction-work-loop.js";
+const FACTION_AGENT_STATUS_SCRIPT = "scripts/faction-agent-status.js";
+const FACTION_AGENT_WORK_SCRIPT = "scripts/faction-agent-work.js";
 const CRIME_LOOP_SCRIPT = "scripts/crime-loop.js";
 // bladeburner-stat-loop.ts/bladeburner-manager.js (2026-08-30) - two more work-loop group members,
 // added once BN4.3/SF4.3 landed and BN6.1 started (see [[bitburner_bn67_bladeburner]]). Bladeburner
@@ -82,12 +95,19 @@ const BLADEBURNER_AGENT_UPGRADE_SKILL_SCRIPT = "scripts/bladeburner-agent-upgrad
 // (ns.read, no ns.bladeburner.* cost) grace-period check, matching how this file already reads
 // /data/servers.json and /data/ram-demand.json without adding to its own resident RAM cost.
 const BLADEBURNER_STATE_PATH = "/data/bladeburner-state.json";
-// augment-loop.js (28.10GB live) is launched by the same block but isn't part of the
-// exclusivity group - purchasing/installing augmentations doesn't touch the shared work slot, so
-// it runs unconditionally alongside whichever of crime/faction/company is active. It only starts
-// once ns.gang.inGang() (its own internal gate too, kept as defensive redundancy) - no point
-// paying its RAM during the whole pre-gang crime grind.
+// augment-loop.js is launched by the same block but isn't part of the exclusivity group -
+// purchasing/installing augmentations doesn't touch the shared work slot, so it runs
+// unconditionally alongside whichever of crime/faction/company is active. It only starts once
+// ns.gang.inGang() (its own internal gate too, kept as defensive redundancy) - no point paying its
+// RAM during the whole pre-gang crime grind. Split into a cheap orchestrator (~3.60GB, same as
+// gang-manager.js) + transient augment-agent-*.js workers (2026-08-30 - see
+// [[bitburner_bn4_singularity]]/[[bitburner_singularity_ram_tier_stale]]): the previous monolith
+// referenced 8 distinct ns.singularity.* functions permanently (~31GB native). See
+// augmentAgentWorkerReserveGb below for its own worker-fleet reserve, same shape as
+// gangAgentWorkerReserveGb/bladeburnerAgentWorkerReserveGb.
 const AUGMENT_LOOP_SCRIPT = "scripts/augment-loop.js";
+const AUGMENT_AGENT_STATUS_SCRIPT = "scripts/augment-agent-status.js";
+const AUGMENT_AGENT_ACT_SCRIPT = "scripts/augment-agent-act.js";
 // program-buy-loop.js added 2026-08-09 (user-directed, same day as the revival above) after
 // confirming no script bought the TOR router / port-opener .exe programs at all - see
 // [[bitburner_bn4_singularity]]. Native cost ~4.55GB (hasTorRouter 0.05 + purchaseTor 2 +
@@ -116,6 +136,88 @@ const BN4_SINGULARITY_SCRIPTS = [
 // only the launch-order subset - BN4_SINGULARITY_SCRIPTS above (all four) remains the single
 // source of truth for currentReserveGb's reserve sum, since reserve totals don't care about order.
 const LOWER_TIER_BN4_SINGULARITY_SCRIPTS = [HOME_CORES_LOOP_SCRIPT, PROGRAM_BUY_LOOP_SCRIPT, BACKDOOR_LOOP_SCRIPT];
+// Killing an exclusivity-group orchestrator by name (see the work-loop kill loop in main()) doesn't
+// touch a transient worker it already dispatched via ns.exec - different script, different PID.
+// Without this, a worker dispatched moments before a work-slot switch could still complete its own
+// live singularity/bladeburner call just after the switch (e.g. faction-agent-work.js calling
+// workForFaction right as bladeburner-manager.js starts) - narrow (these workers run and exit in a
+// fraction of a tick) and self-correcting (the newly-active script's own next tick overrides it),
+// but real. Only faction-work-loop.js/bladeburner-manager.js are ever killed by the exclusivity
+// loop that reads this (see AGENT_WORKER_FLEETS below) - crime-loop.js/company-work-loop.js/
+// bladeburner-stat-loop.js stay monolithic (no dispatched workers to chase), and gang-manager.js/
+// augment-loop.js are never killed at all (gang has no exclusivity group; augment-loop.js isn't
+// part of this one - see AUGMENT_LOOP_SCRIPT's comment) so their entries below are only ever read
+// by agentWorkerReserveGb, never by the kill loop.
+//
+// Single source of truth for "which transient workers does orchestrator X dispatch" - previously
+// this lived in three independently-maintained places (four near-identical *AgentWorkerReserveGb
+// functions, plus a partial-coverage map here that the kill loop alone read), found during a
+// 2026-08-30 code review. Reserve math treats the status worker and the action-worker set as two
+// mutually-exclusive per-tick shapes (see agentWorkerReserveGb below); the kill-chase loop in
+// main() just needs every worker regardless of shape, so it flattens both lists together.
+interface AgentWorkerFleet {
+	statusScript: string;
+	actionScripts: string[];
+}
+
+const AGENT_WORKER_FLEETS = new Map<string, AgentWorkerFleet>([
+	[
+		GANG_MANAGER_SCRIPT,
+		{
+			statusScript: GANG_AGENT_STATUS_SCRIPT,
+			// GANG_AGENT_FOUND_SCRIPT deliberately excluded (not an oversight): gang-manager.ts only
+			// ever dispatches it pre-gang (see that file's own bootstrap branch), a window that never
+			// overlaps with these action workers (all gated on already being in a gang) - same
+			// time-disjoint reasoning bladeburnerAgentWorkerReserveGb used to document inline before
+			// this map replaced it.
+			actionScripts: [GANG_AGENT_RECRUIT_SCRIPT, GANG_AGENT_ASCEND_SCRIPT, GANG_AGENT_ASSIGN_TASK_SCRIPT, GANG_AGENT_BUY_EQUIPMENT_SCRIPT, GANG_AGENT_WARFARE_SCRIPT],
+		},
+	],
+	[
+		BLADEBURNER_LOOP_SCRIPT,
+		{
+			statusScript: BLADEBURNER_AGENT_STATUS_SCRIPT,
+			actionScripts: [BLADEBURNER_AGENT_JOIN_SCRIPT, BLADEBURNER_AGENT_START_ACTION_SCRIPT, BLADEBURNER_AGENT_UPGRADE_SKILL_SCRIPT],
+		},
+	],
+	[AUGMENT_LOOP_SCRIPT, { statusScript: AUGMENT_AGENT_STATUS_SCRIPT, actionScripts: [AUGMENT_AGENT_ACT_SCRIPT] }],
+	[FACTION_WORK_LOOP_SCRIPT, { statusScript: FACTION_AGENT_STATUS_SCRIPT, actionScripts: [FACTION_AGENT_WORK_SCRIPT] }],
+]);
+
+// Every script in orchestratorScript's fleet, status and action workers together - used by the
+// kill-chase loop in main(), which doesn't care which per-tick shape a given worker belongs to.
+function allAgentWorkerScripts(orchestratorScript: string): string[] {
+	const fleet = AGENT_WORKER_FLEETS.get(orchestratorScript);
+	return fleet === undefined ? [] : [fleet.statusScript, ...fleet.actionScripts];
+}
+
+// ns.kill(filename, host) only kills an instance that was itself launched with ZERO args - per its
+// own doc ("Kills the script(s)... running on the specified host with the specified args"), it
+// matches filename+host+args exactly, the same exact-match dispatchOnce's own "a same-args
+// instance is still running" comment relies on for preventDuplicates. Every dispatchOnce(...)
+// call site in this repo's *-manager.ts/*-loop.ts orchestrators passes a JSON-stringified payload
+// as an arg (faction-agent-work.js, bladeburner-agent-start-action.js,
+// bladeburner-agent-upgrade-skill.js, and the whole gang-agent-*.js fleet all do) - a bare
+// ns.kill(worker, "home") with no further args can never match those, silently no-op-ing instead
+// of actually killing them (found via code review, 2026-08-30, right after introducing the
+// kill-chase loop below to close a different race). Enumerating ns.ps(host) and killing by PID
+// sidesteps args-matching entirely - it finds every instance of `filename` regardless of what it
+// was launched with. Takes a whole fleet's filenames at once (not one call per worker) so chasing
+// an N-worker fleet costs one ns.ps(host) scan, not N.
+//
+// Known, accepted race: a worker this same tick's dispatchOnce just ns.exec'd is already visible
+// to ns.ps() (the process table entry exists before the new script's own code has necessarily run
+// its first line yet), so in principle this could kill a worker before it ever calls its live
+// singularity/bladeburner function - the exact opposite of the race this mechanism exists to close.
+// Not fixed: the window is at most one engine tick, self-corrects on the orchestrator's very next
+// cycle (30-60s later) the same way a dropped tick already does elsewhere in this codebase, and
+// this repo already accepts equivalent scheduler-jitter windows by design (see e.g. BATCH_GAP_MS).
+function killAllInstances(ns: NS, filenames: string[], host: string): void {
+	const targets = new Set(filenames);
+	for (const proc of ns.ps(host)) {
+		if (targets.has(proc.filename)) ns.kill(proc.pid);
+	}
+}
 // See the work-loop group comment above. null until the first decision is made; updated only by
 // the launch block in main() (currentReserveGb's own call site only reads these, never writes).
 let activeWorkScript: string | null = null;
@@ -419,39 +521,22 @@ function reserveIfAffordable(ns: NS, script: string): number {
 	return cost < ns.getServerMaxRam("home") ? cost : 0;
 }
 
-// gang-manager.ts dispatches exactly one of two shapes per tick, never both: either
-// gang-agent-status.js alone (report refresh) or some subset of
-// recruit/ascend/assign-task/buy-equipment/warfare together (a decision tick, gated on a fresh
-// report). Reserve the larger of "status alone" vs. "every action worker at once" so whichever
-// shape actually fires this tick always has room, regardless of which one it turns out to be.
-function gangAgentWorkerReserveGb(ns: NS): number {
-	if (!ns.isRunning(GANG_MANAGER_SCRIPT, "home")) return 0;
-	const statusCostGb = ns.getScriptRam(GANG_AGENT_STATUS_SCRIPT, "home");
-	const actionWorkerCostGb = [
-		GANG_AGENT_RECRUIT_SCRIPT,
-		GANG_AGENT_ASCEND_SCRIPT,
-		GANG_AGENT_ASSIGN_TASK_SCRIPT,
-		GANG_AGENT_BUY_EQUIPMENT_SCRIPT,
-		GANG_AGENT_WARFARE_SCRIPT,
-	].reduce((sum, script) => sum + ns.getScriptRam(script, "home"), 0);
-	return Math.max(statusCostGb, actionWorkerCostGb);
-}
-
-// Mirrors gangAgentWorkerReserveGb above for bladeburner-manager.js's own worker fleet. Slightly
-// more conservative than a perfectly tight bound: the join worker can, in one specific case
-// (division already joined but the Bladeburners faction not yet, requiring Rank>=25 - see
-// bladeburner-manager.ts's own comment), be dispatched in the same tick as an action/skill worker,
-// so it's summed into the "decision tick" shape here rather than excluded the way
-// gang-agent-found.ts is excluded above (that script's dispatch is always time-disjoint from gang's
-// action workers).
-function bladeburnerAgentWorkerReserveGb(ns: NS): number {
-	if (!ns.isRunning(BLADEBURNER_LOOP_SCRIPT, "home")) return 0;
-	const statusCostGb = ns.getScriptRam(BLADEBURNER_AGENT_STATUS_SCRIPT, "home");
-	const decisionTickCostGb = [BLADEBURNER_AGENT_JOIN_SCRIPT, BLADEBURNER_AGENT_START_ACTION_SCRIPT, BLADEBURNER_AGENT_UPGRADE_SKILL_SCRIPT].reduce(
-		(sum, script) => sum + ns.getScriptRam(script, "home"),
-		0,
-	);
-	return Math.max(statusCostGb, decisionTickCostGb);
+// Every orchestrator in AGENT_WORKER_FLEETS dispatches exactly one of two shapes per tick, never
+// both: its status worker alone (report refresh) or some/all of its action workers together (a
+// decision tick, gated on a fresh report). Reserve the larger of "status alone" vs. "every action
+// worker at once" so whichever shape actually fires this tick always has room, regardless of which
+// one it turns out to be. Slightly conservative for bladeburner-manager.js specifically: its join
+// worker can, in one case (division already joined but the Bladeburners faction not yet, requiring
+// Rank>=25 - see that file's own comment), be dispatched in the same tick as an action/skill
+// worker, so summing every action script together (rather than trying to model which subsets can
+// co-occur) covers that case for free.
+function agentWorkerReserveGb(ns: NS, orchestratorScript: string): number {
+	if (!ns.isRunning(orchestratorScript, "home")) return 0;
+	const fleet = AGENT_WORKER_FLEETS.get(orchestratorScript);
+	if (fleet === undefined) return 0;
+	const statusCostGb = ns.getScriptRam(fleet.statusScript, "home");
+	const actionCostGb = fleet.actionScripts.reduce((sum, script) => sum + ns.getScriptRam(script, "home"), 0);
+	return Math.max(statusCostGb, actionCostGb);
 }
 
 function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
@@ -469,8 +554,10 @@ function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 	// cost is already reflected in ns.getServerUsedRam so that term drops to 0). This one instead
 	// covers the transient gang-agent-*.js workers it dispatches at runtime, and only matters
 	// once gang-manager.js IS running (see gangAgentWorkerReserveGb's own isRunning guard).
-	const gangAgentReserveGb = gangAgentWorkerReserveGb(ns);
-	const bladeburnerAgentReserveGb = bladeburnerAgentWorkerReserveGb(ns);
+	const gangAgentReserveGb = agentWorkerReserveGb(ns, GANG_MANAGER_SCRIPT);
+	const bladeburnerAgentReserveGb = agentWorkerReserveGb(ns, BLADEBURNER_LOOP_SCRIPT);
+	const augmentAgentReserveGb = agentWorkerReserveGb(ns, AUGMENT_LOOP_SCRIPT);
+	const factionAgentReserveGb = agentWorkerReserveGb(ns, FACTION_WORK_LOOP_SCRIPT);
 	let bn4SingularityReserveGb = 0;
 	for (const script of BN4_SINGULARITY_SCRIPTS) {
 		bn4SingularityReserveGb += reserveIfAffordable(ns, script);
@@ -494,6 +581,8 @@ function currentReserveGb(ns: NS, serverTreeReserveGb: number): number {
 		lowerPriorityReserveGb +
 		gangAgentReserveGb +
 		bladeburnerAgentReserveGb +
+		augmentAgentReserveGb +
+		factionAgentReserveGb +
 		bn4SingularityReserveGb +
 		workLoopReserveGb
 	);
@@ -1218,7 +1307,15 @@ export async function main(ns: NS): Promise<void> {
 			}
 			for (const script of [CRIME_LOOP_SCRIPT, FACTION_WORK_LOOP_SCRIPT, COMPANY_WORK_LOOP_SCRIPT, BLADEBURNER_STAT_LOOP_SCRIPT, BLADEBURNER_LOOP_SCRIPT]) {
 				if (script !== desiredWorkScript && ns.isRunning(script, "home")) {
+					// Plain ns.kill is correct here - every orchestrator above is always launched via a
+					// bare ns.run(script) with no args (confirmed at every call site in this file), so a
+					// zero-arg kill matches it exactly.
 					ns.kill(script, "home");
+					// Also chase down any transient worker this orchestrator might have in flight - see
+					// killAllInstances' own comment for why this can't just be ns.kill(worker, "home")
+					// (most of these are dispatched with a JSON-stringified arg, which a zero-arg kill
+					// can never match).
+					killAllInstances(ns, allAgentWorkerScripts(script), "home");
 				}
 			}
 			if (!ns.isRunning(desiredWorkScript, "home")) {

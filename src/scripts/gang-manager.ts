@@ -1,5 +1,6 @@
 import type { NS } from "../NetscriptDefinitions";
 import type { GangMemberSnapshot, GangTaskSnapshot, GangEquipmentSnapshot, GangStateReport } from "../lib/types";
+import { dispatchOnce, isStale, readJson } from "../lib/manager-dispatch";
 
 // Split into a cheap orchestrator + transient gang-agent-*.ts workers (2026-08-10, user-directed
 // RAM fix - see [[bitburner_bn4_singularity]]): the previous single-file gang-manager.ts
@@ -65,27 +66,6 @@ const RESERVE_FRACTION = 0.1;
 const TARGET_FACTION_REPUTATION = 3_500_000;
 const GANG_RESPECT_TO_REPUTATION_RATIO = 75;
 const EARN_MONEY_RESPECT_THRESHOLD = TARGET_FACTION_REPUTATION * GANG_RESPECT_TO_REPUTATION_RATIO;
-
-function readReport(ns: NS): GangStateReport | undefined {
-	if (!ns.fileExists(GANG_STATE_PATH, "home")) return undefined;
-	const raw = ns.read(GANG_STATE_PATH);
-	if (!raw) return undefined;
-	return JSON.parse(raw) as GangStateReport;
-}
-
-function isStale(writtenAt: number, thresholdMs: number): boolean {
-	return Date.now() - writtenAt > thresholdMs;
-}
-
-function dispatchOnce(ns: NS, script: string, ...args: string[]): boolean {
-	const pid = ns.exec(script, "home", { threads: 1, preventDuplicates: true }, ...args);
-	if (pid === 0) {
-		ns.print(`gang-manager: couldn't dispatch ${script} - check RAM, or a same-args instance is still running`);
-		return false;
-	}
-	ns.print(`gang-manager: dispatched ${script} (pid ${pid})`);
-	return true;
-}
 
 // "Train Combat"/"Train Hacking" both carry isCombat: true, isHacking: true in the game's own
 // task metadata (they're universal, assignable to either gang type), so filtering on those
@@ -248,14 +228,14 @@ export async function main(ns: NS): Promise<void> {
 		// inGang() is 0GB (free) - safe to call directly every tick without adding to this
 		// script's resident cost, unlike every other ns.gang.* function referenced below.
 		if (!ns.gang.inGang()) {
-			dispatchOnce(ns, GANG_AGENT_FOUND_SCRIPT);
+			dispatchOnce(ns, "gang-manager", GANG_AGENT_FOUND_SCRIPT);
 			await ns.sleep(BOOTSTRAP_POLL_MS);
 			continue;
 		}
 
-		const report = readReport(ns);
+		const report = readJson<GangStateReport>(ns, GANG_STATE_PATH);
 		if (!report || isStale(report.writtenAt, STATUS_REFRESH_MS)) {
-			dispatchOnce(ns, GANG_AGENT_STATUS_SCRIPT);
+			dispatchOnce(ns, "gang-manager", GANG_AGENT_STATUS_SCRIPT);
 			await ns.sleep(GANG_MANAGER_INTERVAL_MS);
 			continue;
 		}
@@ -263,27 +243,27 @@ export async function main(ns: NS): Promise<void> {
 		let acted = false;
 
 		if (report.canRecruit) {
-			if (dispatchOnce(ns, GANG_AGENT_RECRUIT_SCRIPT, JSON.stringify(report.members.map((m) => m.name)))) acted = true;
+			if (dispatchOnce(ns, "gang-manager", GANG_AGENT_RECRUIT_SCRIPT, JSON.stringify(report.members.map((m) => m.name)))) acted = true;
 		}
 
 		const ascendNames = report.members.filter((m) => m.ascensionGain !== undefined && m.ascensionGain >= ASCENSION_MULT_THRESHOLD).map((m) => m.name);
 		if (ascendNames.length > 0) {
-			if (dispatchOnce(ns, GANG_AGENT_ASCEND_SCRIPT, JSON.stringify(ascendNames))) acted = true;
+			if (dispatchOnce(ns, "gang-manager", GANG_AGENT_ASCEND_SCRIPT, JSON.stringify(ascendNames))) acted = true;
 		}
 
 		const taskAssignments = computeTaskAssignments(report);
 		if (taskAssignments.length > 0) {
-			if (dispatchOnce(ns, GANG_AGENT_ASSIGN_TASK_SCRIPT, JSON.stringify(taskAssignments))) acted = true;
+			if (dispatchOnce(ns, "gang-manager", GANG_AGENT_ASSIGN_TASK_SCRIPT, JSON.stringify(taskAssignments))) acted = true;
 		}
 
 		const purchases = computeEquipmentPurchases(report);
 		if (purchases.length > 0) {
-			if (dispatchOnce(ns, GANG_AGENT_BUY_EQUIPMENT_SCRIPT, JSON.stringify(purchases))) acted = true;
+			if (dispatchOnce(ns, "gang-manager", GANG_AGENT_BUY_EQUIPMENT_SCRIPT, JSON.stringify(purchases))) acted = true;
 		}
 
 		const desiredWarfare = computeWarfareDecision(report);
 		if (desiredWarfare !== undefined) {
-			if (dispatchOnce(ns, GANG_AGENT_WARFARE_SCRIPT, JSON.stringify(desiredWarfare))) acted = true;
+			if (dispatchOnce(ns, "gang-manager", GANG_AGENT_WARFARE_SCRIPT, JSON.stringify(desiredWarfare))) acted = true;
 		}
 
 		// Force a fresh status snapshot before deciding again, rather than trusting this report

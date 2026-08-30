@@ -2,6 +2,7 @@ import type { NS } from "../NetscriptDefinitions";
 import type { CorpCoreReport, CorpUnlocksReport, CorpOfficeReport, CorpWarehouseReport, CorpIndustryReport, CorpMaterialReport } from "../lib/types";
 import type { StaffingTask, CityName } from "../lib/corp-constants";
 import { ALL_CITIES, OFFICE_ROLES, MORALE_ENERGY_THRESHOLD_FRACTION } from "../lib/corp-constants";
+import { dispatchOnce, isStale, readJson } from "../lib/manager-dispatch";
 
 const CORP_AGENT_CREATE_SCRIPT = "scripts/corp-agent-create.js";
 const STATUS_CORP_SCRIPT = "scripts/corp-agent-status-corp.js";
@@ -50,34 +51,6 @@ const OFFICES_REFRESH_MS = 60000;
 const WAREHOUSES_REFRESH_MS = 60000;
 const MATERIALS_REFRESH_MS = 60000;
 
-function readJson<T>(ns: NS, path: string): T | undefined {
-	if (!ns.fileExists(path, "home")) return undefined;
-	const raw = ns.read(path);
-	if (!raw) return undefined;
-	return JSON.parse(raw) as T;
-}
-
-function isStale(writtenAt: number, thresholdMs: number): boolean {
-	return Date.now() - writtenAt > thresholdMs;
-}
-
-function dispatchOnce(ns: NS, script: string, ...args: string[]): boolean {
-	const pid = ns.exec(script, "home", { threads: 1, preventDuplicates: true }, ...args);
-	if (pid === 0) {
-		// Covers two distinct causes that both return pid 0 - not enough free RAM, or
-		// preventDuplicates blocking a second launch of the same script+args combo while an
-		// earlier dispatch is still resident. Confirmed live (2026-08-04): this print-only-on-
-		// failure design left no visibility into what corp-manager.ts was actually dispatching
-		// tick to tick, which made a real stuck-loop symptom (materials never getting sell orders
-		// set) impossible to diagnose from this file's own tail alone. Logging every dispatch, not
-		// just failures, going forward.
-		ns.print(`corp-manager: couldn't dispatch ${script} - check RAM, or a same-args instance is still running`);
-		return false;
-	}
-	ns.print(`corp-manager: dispatched ${script} (pid ${pid})`);
-	return true;
-}
-
 // For write actions only (buy-unlock, found-division, expand-city, purchase-warehouse,
 // enable-smart-supply, ...): deletes the cached report that produced the "needs action" decision
 // after a successful dispatch, forcing the next tick to re-verify real game state via a fresh
@@ -89,7 +62,7 @@ function dispatchOnce(ns: NS, script: string, ...args: string[]): boolean {
 // for anything that spends money per call, like purchaseWarehouse. Skipped on a failed dispatch
 // (RAM-blocked) since nothing actually happened - the report is still accurate.
 function dispatchWriteAction(ns: NS, script: string, invalidatePath: string, ...args: string[]): boolean {
-	const dispatched = dispatchOnce(ns, script, ...args);
+	const dispatched = dispatchOnce(ns, "corp-manager", script, ...args);
 	if (dispatched) ns.rm(invalidatePath, "home");
 	return dispatched;
 }
@@ -111,7 +84,7 @@ export async function main(ns: NS): Promise<void> {
 			continue;
 		}
 
-		dispatchOnce(ns, CORP_AGENT_CREATE_SCRIPT);
+		dispatchOnce(ns, "corp-manager", CORP_AGENT_CREATE_SCRIPT);
 		await ns.sleep(BOOTSTRAP_POLL_MS);
 	}
 
@@ -135,13 +108,13 @@ export async function main(ns: NS): Promise<void> {
 
 		const core = readJson<CorpCoreReport>(ns, CORP_CORE_PATH);
 		if (!core || isStale(core.writtenAt, CORE_REFRESH_MS)) {
-			dispatchOnce(ns, STATUS_CORP_SCRIPT);
+			dispatchOnce(ns, "corp-manager", STATUS_CORP_SCRIPT);
 			continue;
 		}
 
 		const unlocks = readJson<CorpUnlocksReport>(ns, CORP_UNLOCKS_PATH);
 		if (!unlocks || isStale(unlocks.writtenAt, UNLOCKS_REFRESH_MS)) {
-			dispatchOnce(ns, CHECK_UNLOCKS_SCRIPT);
+			dispatchOnce(ns, "corp-manager", CHECK_UNLOCKS_SCRIPT);
 			continue;
 		}
 
@@ -159,7 +132,7 @@ export async function main(ns: NS): Promise<void> {
 		// no staleness check, unlike every other report here.
 		const industry = readJson<CorpIndustryReport>(ns, CORP_INDUSTRY_PATH);
 		if (!industry) {
-			dispatchOnce(ns, INDUSTRY_DATA_SCRIPT);
+			dispatchOnce(ns, "corp-manager", INDUSTRY_DATA_SCRIPT);
 			continue;
 		}
 
@@ -171,7 +144,7 @@ export async function main(ns: NS): Promise<void> {
 
 		const warehouses = readJson<CorpWarehouseReport>(ns, CORP_WAREHOUSES_PATH);
 		if (!warehouses || isStale(warehouses.writtenAt, WAREHOUSES_REFRESH_MS)) {
-			dispatchOnce(ns, STATUS_WAREHOUSES_SCRIPT, JSON.stringify(core.cities));
+			dispatchOnce(ns, "corp-manager", STATUS_WAREHOUSES_SCRIPT, JSON.stringify(core.cities));
 			continue;
 		}
 
@@ -205,7 +178,7 @@ export async function main(ns: NS): Promise<void> {
 
 		const offices = readJson<CorpOfficeReport>(ns, CORP_OFFICES_PATH);
 		if (!offices || isStale(offices.writtenAt, OFFICES_REFRESH_MS)) {
-			dispatchOnce(ns, STATUS_OFFICES_SCRIPT, JSON.stringify(core.cities));
+			dispatchOnce(ns, "corp-manager", STATUS_OFFICES_SCRIPT, JSON.stringify(core.cities));
 			continue;
 		}
 
@@ -228,7 +201,7 @@ export async function main(ns: NS): Promise<void> {
 
 		const materials = readJson<CorpMaterialReport>(ns, CORP_MATERIALS_PATH);
 		if (!materials || isStale(materials.writtenAt, MATERIALS_REFRESH_MS)) {
-			dispatchOnce(ns, STATUS_MATERIALS_SCRIPT, JSON.stringify(core.cities), JSON.stringify(industry.producedMaterials));
+			dispatchOnce(ns, "corp-manager", STATUS_MATERIALS_SCRIPT, JSON.stringify(core.cities), JSON.stringify(industry.producedMaterials));
 			continue;
 		}
 

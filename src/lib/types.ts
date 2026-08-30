@@ -1,3 +1,15 @@
+import type { NS } from "../NetscriptDefinitions";
+
+// FactionName isn't exported from NetscriptDefinitions.d.ts - derive it once here from a
+// singularity method's own signature (any of them works, they all share the same parameter type)
+// rather than each of the three files that need it (singularity-factions.ts, augment-agent-act.ts,
+// faction-agent-work.ts) re-deriving it independently. Safe to share from a file with no runtime
+// ns.* usage of its own - unlike the NEUROFLUX_NAME lesson (see singularity-constants.ts), a `type`
+// alias is fully erased at compile time and contributes zero RAM regardless of what else lives in
+// the file it's imported from, but this repo keeps type-only exports in this already-established
+// "just types" file rather than mixing them into a runtime-values file on principle.
+export type FactionName = Parameters<NS["singularity"]["getFactionRep"]>[0];
+
 export interface ServerReport {
 	hostname: string;
 	rooted: boolean;
@@ -308,4 +320,98 @@ export interface BladeburnerStateReport {
 	operations: BladeburnerActionCandidate[];
 	skills: BladeburnerSkillSnapshot[];
 	writtenAt: number;
+}
+
+// Augment report types, written by augment-agent-status.ts and read by augment-loop.ts
+// (2026-08-30 RAM split - see [[bitburner_bn4_singularity]]/[[bitburner_augment_loop_nfg_gate]]):
+// augment-loop.ts used to reference 8 distinct ns.singularity.* functions permanently (~31GB
+// native, once SF4.3's multiplier is accounted for - see
+// [[bitburner_singularity_ram_tier_stale]]), mirroring the same shape gang-manager.ts/
+// corp-manager.ts/bladeburner-manager.ts already fixed for their own subsystems. Faction names are
+// kept as plain string here (not the derived FactionName type augment-loop.ts uses internally) -
+// matches this file's existing plain-primitives convention for JSON-round-tripped report fields.
+export interface AugmentAugSnapshot {
+	name: string;
+	repReq: number;
+	// Live price at the moment of this status snapshot - already stale by the time a purchase
+	// actually lands (each purchase raises every remaining augmentation's price), so
+	// augment-agent-act.ts re-reads the live price immediately before every purchase rather than
+	// trusting this field for anything but candidate sort order and rough budget planning.
+	price: number;
+}
+
+export interface AugmentFactionSnapshot {
+	faction: string;
+	rep: number;
+	augmentations: AugmentAugSnapshot[];
+}
+
+export interface AugmentStateReport {
+	playerMoney: number;
+	factionRepMult: number;
+	// null if not in a gang yet - augment-loop.ts only ever runs once ns.gang.inGang() is true (see
+	// its own bootstrap gate), but the report shape stays defined either way.
+	gangFaction: string | null;
+	installedList: string[];
+	ownedList: string[];
+	factions: AugmentFactionSnapshot[];
+	writtenAt: number;
+}
+
+// Faction-work report types, written by faction-agent-status.ts and read by
+// faction-work-loop.ts (2026-08-30 RAM split, same shape/rationale as AugmentStateReport above).
+export interface FactionAugSnapshot {
+	name: string;
+	repReq: number;
+}
+
+export interface FactionCandidateSnapshot {
+	faction: string;
+	rep: number;
+	augmentations: FactionAugSnapshot[];
+}
+
+export interface FactionCurrentWork {
+	type: string;
+	// Only meaningful when type === "FACTION" - null otherwise (e.g. type "COMPANY" or "CLASS").
+	factionName: string | null;
+}
+
+export interface FactionWorkStateReport {
+	currentWork: FactionCurrentWork | null;
+	owned: string[];
+	factions: FactionCandidateSnapshot[];
+	writtenAt: number;
+}
+
+// Payload shapes crossing the ns.exec JSON boundary between augment-loop.ts and
+// augment-agent-act.ts - centralized here rather than independently declared on each side, since
+// JSON.stringify/JSON.parse gives no compile-time link across that boundary otherwise (a field
+// added/renamed on one side without mirroring the other would compile fine on both ends and only
+// fail silently at runtime).
+export interface AugmentActCandidate {
+	faction: string;
+	name: string;
+}
+
+export interface AugmentActDonateTarget extends AugmentActCandidate {
+	gap: number;
+}
+
+export interface AugmentActPayload {
+	candidates: AugmentActCandidate[];
+	budget: number;
+	donateTarget: AugmentActDonateTarget | null;
+	factionRepMult: number;
+	nfgFaction: string | null;
+	queuedHasReal: boolean;
+	nothingRealLeft: boolean;
+}
+
+// Payload shape crossing the ns.exec JSON boundary between faction-work-loop.ts and
+// faction-agent-work.ts - same centralization rationale as AugmentActPayload above.
+export interface FactionWorkPayload {
+	ordered: string[];
+	// currentWork's factionName if type === "FACTION", else null.
+	alreadyWorkingFaction: string | null;
 }
