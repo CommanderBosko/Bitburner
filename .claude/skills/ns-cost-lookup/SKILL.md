@@ -46,3 +46,7 @@ If any of the looked-up costs are for functions **not already present** in `.cla
 ## Scripts
 
 - `scripts/ns-cost-lookup.mjs <name> [<name> ...]` — the resolver (plain Node, no dependencies). Strips comments (preserving line/column layout) to safely brace-match the `NS` interface's body and, for dotted names, the resolved sub-interface's body; finds the first matching member signature within the correct block; walks upward through its contiguous doc-comment lines in the *original* (comment-preserving) text; and extracts a `RAM cost: X GB` line if present. Exits non-zero if any name was unresolved.
+
+## Gotchas
+
+- **A stray blank line inside a function's JSDoc comment used to crash the walk instead of failing cleanly.** Confirmed 2026-08-30 on `singularity.gymWorkout`: the upward contiguous-comment walk stopped one line early, missed the `RAM cost:` line, and the caller's `result.cost.toFixed(2)` threw on `null` — surfacing as a raw Node stack trace (exit 1) rather than the documented "no RAM cost line" message from Step 2. Fixed in `ns-cost-lookup.mjs` (now tolerates exactly one stray blank line before treating two-in-a-row as having left the comment block) — if a lookup ever crashes with a stack trace instead of printing a clean per-name line, suspect this class of bug again before assuming the exit-1 convention in Step 2 is what's being hit.

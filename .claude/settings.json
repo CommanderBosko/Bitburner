@@ -6,7 +6,17 @@
       "Bash(/home/bosko/.claude/skills/session-closer/scripts/scan-session.sh transcript *)",
       "Bash(rtk find *)",
       "Bash(/home/bosko/NixOS/.claude/skills/nixos-dry-run/scripts/dry-run.sh)",
-      "Bash(nix search *)"
+      "Bash(nix search *)",
+      "Bash(node .claude/skills/ns-cost-lookup/scripts/ns-cost-lookup.mjs*)",
+      "Bash(node .claude/skills/activate-check/scripts/activate-check.mjs*)",
+      "Bash(node .claude/skills/ram-audit/scripts/ram-audit.mjs*)",
+      "Bash(.claude/skills/secret-scan/scripts/secret-scan.sh*)",
+      "Bash(.claude/skills/sync-verify/scripts/sync-verify.sh*)",
+      "Bash(.claude/skills/dev-watch/scripts/dev-watch.sh status*)",
+      "Bash(/home/bosko/.claude/skills/git-push/scripts/push.sh status)",
+      "Bash(bash -n *)",
+      "mcp__nixos__nix",
+      "mcp__tailscale__tailscale_list_devices"
     ]
   }
 }
