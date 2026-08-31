@@ -1,3 +1,26 @@
+## Session: 2026-08-19 — backdoor-loop auto-completes the BitNode via w0r1d_d43m0n; BN4.2 done, BN4.3 started
+
+**Focus**: Add `w0r1d_d43m0n` to `backdoor-loop.ts`'s target list so the BitNode gets destroyed automatically once reachable, then update memory to reflect BN4.2's completion (SF4.2 obtained) and the start of BN4.3.
+
+### What changed (and why)
+- **`2c41d2f`** — `backdoor-loop.ts`: added `w0r1d_d43m0n` to `TARGET_HOSTS`. The game's own `destroyW0r1dD43m0n()` doc says the hacking route can destroy the BitNode more cheaply via a plain `installBackdoor()` call on `w0r1d_d43m0n` itself — this repo's existing comment claimed the opposite (deliberately excluded, destroyed via `ns.hack()` instead), which was wrong. The Red Pill aug requirement that route needs is already covered by the loop's existing `The-Cave` gate, so no new code path was needed — just adding the host to the existing allowlist. Corrected the stale comment in the same commit. Build-checked clean, synced live; not yet exercised (no `w0r1d_d43m0n` reachable this session).
+- Memory updates only, no further code: `[[bitburner_bn4_singularity]]`, `[[bitburner_singularity_locked]]`, `[[bitburner_bitnode_route]]`, and `MEMORY.md` all updated to reflect BN4.2 completed (SF4.2 obtained, outside-BN4 RAM multiplier 16x→4x) and BN4.3 (final clear toward SF4.3) now in progress.
+
+### Decisions
+- Used the existing generic install-backdoor-on-rooted-target loop rather than a dedicated destroy-BitNode script or a direct `destroyW0r1dD43m0n()` call — cheaper, and leaves the player on the BitVerse selection screen (no `nextBN` param on `installBackdoor`) so picking the next BitNode stays a manual choice per the researched route.
+
+### Issues / surprises
+- The repo's own `backdoor-loop.ts` comment about `w0r1d_d43m0n` turned out to be factually wrong (claimed `ns.hack()`-based destruction) — caught by reading the game's own type-definition doc comment rather than trusting the existing comment at face value.
+
+### Next session
+- Watch `backdoor-loop.ts` actually reach and backdoor `w0r1d_d43m0n` to confirm it destroys the BitNode as the docs describe — first real test whenever BN4.3 gets there.
+- BN4.2's endgame specifics (territory-warfare threshold, NFG-donation branch, backdoor-loop allowlist, pre-NFG augment donations) were never explicitly confirmed before the transition — re-watch all of them fresh in BN4.3.
+- After BN4.3 lands (SF4.3), move on to BN6+BN7 per `[[bitburner_bitnode_route]]`.
+
+**Commits**: `eef195e..2c41d2f` (1 commit this session: `2c41d2f`)
+
+---
+
 ## Session: 2026-08-17/18 — NFG-gate family's 4th and 5th fixes, territory-warfare threshold override, crime-loop focus flip-flop
 
 _Older entries are in [session-summary-archive.md](session-summary-archive.md)._

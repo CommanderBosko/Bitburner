@@ -1,3 +1,27 @@
+## Session: 2026-08-30 (later) — manager agent's first real-world /improve-system delegation, merged as PR #1
+
+**Focus**: Test the `manager` agent's ability to run a full `/improve-system` sweep unattended (no mid-run `AskUserQuestion`), land it via branch+PR, and have the user review and merge.
+
+### What changed (and why)
+- Kicked off `manager` (reads `~/.claude/manager-profile.md` for decision style) with an explicit full-autonomy framing. It ran all six `/improve-system` sub-skills, self-verified (`npm run build`, `bash -n`, `secret-scan`, a smoke test), and opened PR #1 (`chore/improve-system-sweep-2026-08-30`) rather than pushing to `main`.
+- Landed: new `split-manager-loop` skill (formalizes the orchestrator+worker RAM-split pattern already hand-applied 5 times); `record-unlock.sh` replacing `check-unlock`'s manual memory-append; `ship-fix`'s destructive gate routed through `AskUserQuestion`; a Gotcha on `ns-cost-lookup`'s already-fixed JSDoc-blank-line crash; 10 read-only permission entries in `.claude/settings.json`.
+- User independently re-verified the diff (small, clean, no secrets, no destructive ops, every code reference real) before merging (`22e5730`).
+
+### Decisions
+- Ran this as a genuine full-autonomy test, landed via branch+PR rather than direct-to-main — hard limits (no direct push, no secrets, no destructive ops) stayed intact even with `AskUserQuestion` unavailable mid-run; the agent self-approved two normally-gated structural decisions using its profile as the standard, then flagged them explicitly for the user's own review.
+- Kept the 2 read-only MCP permission entries (`nixos`/`tailscale`) that landed in this project's settings despite neither tool being used by bitburner work — low-risk, user accepted as-is rather than asking for a prune.
+
+### Issues / surprises
+- One out-of-scope finding surfaced but not fixed here: the global `save-memory` skill hardcodes the NixOS repo's memory path instead of resolving per-project — worth a fix next time `improve-system` runs in that repo.
+
+### Next session
+- No bitburner-gameplay next steps from this session — see the entry below for the live game-state carryover (BN6.1 confirmations, `wantRespect` bug, etc.), unchanged by this tooling-only session.
+- If a similar manager-agent delegation is run again, this session is the reference case for how it should go (self-verified, branch+PR, judgment calls flagged not buried).
+
+**Commits**: `93913ec..22e5730` (2 commits: the sweep + its merge)
+
+---
+
 ## Session: 2026-08-30 — BN4.3 complete, BN6.1 (Bladeburner) started; augment/faction RAM split; bladeburner-loop built
 
 _Older entries are in [session-summary-archive.md](session-summary-archive.md)._
@@ -122,29 +146,6 @@ _Older entries are in [session-summary-archive.md](session-summary-archive.md)._
 - BN4.3 items carried forward unchanged from the 2026-08-19 close below (backdoor-loop `w0r1d_d43m0n` trigger, territory-warfare threshold, NFG-donation branch — all still unconfirmed live).
 
 **Commits**: `9e15d50..676046f` (2 commits this session: `17cbd5f`, `676046f`)
-
----
-
-## Session: 2026-08-19 — backdoor-loop auto-completes the BitNode via w0r1d_d43m0n; BN4.2 done, BN4.3 started
-
-**Focus**: Add `w0r1d_d43m0n` to `backdoor-loop.ts`'s target list so the BitNode gets destroyed automatically once reachable, then update memory to reflect BN4.2's completion (SF4.2 obtained) and the start of BN4.3.
-
-### What changed (and why)
-- **`2c41d2f`** — `backdoor-loop.ts`: added `w0r1d_d43m0n` to `TARGET_HOSTS`. The game's own `destroyW0r1dD43m0n()` doc says the hacking route can destroy the BitNode more cheaply via a plain `installBackdoor()` call on `w0r1d_d43m0n` itself — this repo's existing comment claimed the opposite (deliberately excluded, destroyed via `ns.hack()` instead), which was wrong. The Red Pill aug requirement that route needs is already covered by the loop's existing `The-Cave` gate, so no new code path was needed — just adding the host to the existing allowlist. Corrected the stale comment in the same commit. Build-checked clean, synced live; not yet exercised (no `w0r1d_d43m0n` reachable this session).
-- Memory updates only, no further code: `[[bitburner_bn4_singularity]]`, `[[bitburner_singularity_locked]]`, `[[bitburner_bitnode_route]]`, and `MEMORY.md` all updated to reflect BN4.2 completed (SF4.2 obtained, outside-BN4 RAM multiplier 16x→4x) and BN4.3 (final clear toward SF4.3) now in progress.
-
-### Decisions
-- Used the existing generic install-backdoor-on-rooted-target loop rather than a dedicated destroy-BitNode script or a direct `destroyW0r1dD43m0n()` call — cheaper, and leaves the player on the BitVerse selection screen (no `nextBN` param on `installBackdoor`) so picking the next BitNode stays a manual choice per the researched route.
-
-### Issues / surprises
-- The repo's own `backdoor-loop.ts` comment about `w0r1d_d43m0n` turned out to be factually wrong (claimed `ns.hack()`-based destruction) — caught by reading the game's own type-definition doc comment rather than trusting the existing comment at face value.
-
-### Next session
-- Watch `backdoor-loop.ts` actually reach and backdoor `w0r1d_d43m0n` to confirm it destroys the BitNode as the docs describe — first real test whenever BN4.3 gets there.
-- BN4.2's endgame specifics (territory-warfare threshold, NFG-donation branch, backdoor-loop allowlist, pre-NFG augment donations) were never explicitly confirmed before the transition — re-watch all of them fresh in BN4.3.
-- After BN4.3 lands (SF4.3), move on to BN6+BN7 per `[[bitburner_bitnode_route]]`.
-
-**Commits**: `eef195e..2c41d2f` (1 commit this session: `2c41d2f`)
 
 ---
 
